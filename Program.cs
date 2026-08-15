@@ -1,0 +1,144 @@
+using System.Text.Json;
+
+namespace RdpHoneypot;
+
+/// <summary>
+/// 防禦型 RDP 蜜罐入口 (僅限授權環境使用)
+/// 
+/// 用法:
+///   RdpHoneypot                      使用 config.json
+///   RdpHoneypot --config my.json     使用指定設定檔
+///   RdpHoneypot --port 4499,4500     命令列覆寫連接埠
+///   RdpHoneypot --output logs        命令列覆寫記錄目錄
+/// 
+/// 設定檔格式 (JSON):
+/// {
+///   "ports":  [4499, 4500, 4501],
+///   "logDir": "logs"
+/// }
+/// </summary>
+static class Program
+{
+    static async Task<int> Main(string[] args)
+    {
+        string configPath = Path.Combine(Environment.CurrentDirectory, "config.json");
+        var cliPorts = new List<int>();      // 空 = 未指定
+        string? cliOutput = null;            // null = 未指定
+
+        for (int i = 0; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--config" when i + 1 < args.Length:
+                    configPath = args[++i];
+                    break;
+
+                case "--port" when i + 1 < args.Length:
+                    cliPorts = ParsePorts(args[++i]);
+                    break;
+
+                case "--output" when i + 1 < args.Length:
+                    cliOutput = args[++i];
+                    break;
+
+                case "--help":
+                case "-h":
+                    Console.WriteLine("""
+                        RDP Honeypot (防禦型蜜罐)
+                        用法:
+                          RdpHoneypot [--config config.json] [--port 4499[,4500,...]] [--output logs]
+                        設定檔 (JSON):
+                          { "ports": [4499, 4500], "logDir": "logs" }
+                        參數:
+                          --config  設定檔路徑 (預設 ./config.json)
+                          --port    覆寫監聽連接埠 (多個用逗號分隔)
+                          --output  覆寫記錄目錄
+                        """);
+                    return 0;
+            }
+        }
+
+        // ── 讀取設定檔 ──
+        AppConfig? config = null;
+        if (File.Exists(configPath))
+        {
+            try
+            {
+                config = JsonSerializer.Deserialize<AppConfig>(
+                    await File.ReadAllTextAsync(configPath),
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                Console.WriteLine($"[設定] 已讀取設定檔: {configPath}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[錯誤] 設定檔解析失敗: {ex.Message}");
+                return 1;
+            }
+        }
+        else
+        {
+            Console.WriteLine($"[設定] 找不到設定檔 {configPath}，使用預設值。");
+        }
+
+        // ── 合併設定: 命令列優先於設定檔 ──
+        var ports = cliPorts.Count > 0 ? cliPorts : (config?.Ports ?? []);
+        if (ports.Count == 0) ports = [4499];
+
+        string output = cliOutput ?? config?.LogDir ?? Path.Combine(AppContext.BaseDirectory, "logs");
+
+        // 去重
+        ports = ports.Distinct().ToList();
+
+        // ── 驗證連接埠 ──
+        foreach (var port in ports)
+        {
+            if (port < 1 || port > 65535)
+            {
+                Console.Error.WriteLine($"無效連接埠: {port}");
+                return 1;
+            }
+
+            // 安全防護：禁止使用 3389 (正常 Windows RDP) 及常用系統連接埠
+            if (port == 3389 || port == 3388 || port < 1024)
+            {
+                Console.Error.WriteLine($"[安全防護] 連接埠 {port} 被拒絕：蜜罐不得使用 3389 (正常 RDP) 或低於 1024 的系統連接埠，避免影響正式服務。");
+                Console.Error.WriteLine("請改用其他連接埠，例如預設的 4499。");
+                return 1;
+            }
+        }
+
+        try
+        {
+            var server = new HoneypotServer(ports, output);
+            await server.RunAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"啟動失敗: {ex.Message}");
+            return 1;
+        }
+
+        return 0;
+    }
+
+    /// <summary>解析逗號分隔的連接埠清單</summary>
+    static List<int> ParsePorts(string raw)
+    {
+        var result = new List<int>();
+        foreach (var part in raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (int.TryParse(part, out var p))
+                result.Add(p);
+            else
+                Console.Error.WriteLine($"[警告] 忽略無效連接埠: '{part}'");
+        }
+        return result;
+    }
+}
+
+/// <summary>設定檔結構 (JSON)</summary>
+class AppConfig
+{
+    public List<int>? Ports { get; set; }
+    public string? LogDir { get; set; }
+}
