@@ -1,3 +1,16 @@
 {
-  "ports": [4499, 4500, 4501]
+  "ports": [4499, 4500, 4501],
+  "maxConcurrentSessions": 2000,
+  "maxConcurrentPerIp": 8,
+  "maxConcurrentPerSubnet": 150,
+  "maxPacketBytes": 262144,
+  "maxRawCaptureBytesPerSession": 4194304,
+  "x224TimeoutSeconds": 3,
+  "tlsTimeoutSeconds": 5,
+  "mcsTimeoutSeconds": 5,
+  "credSspTimeoutSeconds": 10,
+  "idleTimeoutSeconds": 20,
+  "eventQueueCapacity": 100000,
+  "enableRawCapture": false,
+  "logDir": null
 }

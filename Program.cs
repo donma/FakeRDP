@@ -4,17 +4,29 @@ namespace RdpHoneypot;
 
 /// <summary>
 /// 防禦型 RDP 蜜罐入口 (僅限授權環境使用)
-/// 
+///
 /// 用法:
 ///   RdpHoneypot                      使用 config.json
 ///   RdpHoneypot --config my.json     使用指定設定檔
 ///   RdpHoneypot --port 4499,4500     命令列覆寫連接埠
 ///   RdpHoneypot --output logs        命令列覆寫記錄目錄
-/// 
+///
 /// 設定檔格式 (JSON):
 /// {
-///   "ports":  [4499, 4500, 4501],
-///   "logDir": "logs"
+///   "ports": [4499, 4500, 4501],
+///   "maxConcurrentSessions": 2000,
+///   "maxConcurrentPerIp": 8,
+///   "maxConcurrentPerSubnet": 150,
+///   "maxPacketBytes": 262144,
+///   "maxRawCaptureBytesPerSession": 4194304,
+///   "x224TimeoutSeconds": 3,
+///   "tlsTimeoutSeconds": 5,
+///   "mcsTimeoutSeconds": 5,
+///   "credSspTimeoutSeconds": 10,
+///   "idleTimeoutSeconds": 20,
+///   "eventQueueCapacity": 100000,
+///   "enableRawCapture": false,
+///   "logDir": null
 /// }
 /// </summary>
 static class Program
@@ -48,7 +60,19 @@ static class Program
                         用法:
                           RdpHoneypot [--config config.json] [--port 4499[,4500,...]] [--output logs]
                         設定檔 (JSON):
-                          { "ports": [4499, 4500], "logDir": "logs" }
+                          {
+                            "ports": [4499, 4500, 4501],
+                            "maxConcurrentSessions": 2000,
+                            "maxConcurrentPerIp": 8,
+                            "maxConcurrentPerSubnet": 150,
+                            "maxPacketBytes": 262144,
+                            "x224TimeoutSeconds": 3,
+                            "tlsTimeoutSeconds": 5,
+                            "mcsTimeoutSeconds": 5,
+                            "credSspTimeoutSeconds": 10,
+                            "idleTimeoutSeconds": 20,
+                            "enableRawCapture": false
+                          }
                         參數:
                           --config  設定檔路徑 (預設 ./config.json)
                           --port    覆寫監聽連接埠 (多個用逗號分隔)
@@ -59,14 +83,16 @@ static class Program
         }
 
         // ── 讀取設定檔 ──
-        AppConfig? config = null;
+        var options = new HoneypotOptions();
         if (File.Exists(configPath))
         {
             try
             {
-                config = JsonSerializer.Deserialize<AppConfig>(
+                var loaded = JsonSerializer.Deserialize<HoneypotOptions>(
                     await File.ReadAllTextAsync(configPath),
                     new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                if (loaded != null)
+                    options = loaded;
                 Console.WriteLine($"[設定] 已讀取設定檔: {configPath}");
             }
             catch (Exception ex)
@@ -81,13 +107,14 @@ static class Program
         }
 
         // ── 合併設定: 命令列優先於設定檔 ──
-        var ports = cliPorts.Count > 0 ? cliPorts : (config?.Ports ?? []);
+        var ports = cliPorts.Count > 0 ? cliPorts : (options.Ports ?? []);
         if (ports.Count == 0) ports = [4499];
 
-        string output = cliOutput ?? config?.LogDir ?? AppContext.BaseDirectory;
+        options.Ports = ports.Distinct().ToList();
 
-        // 去重
-        ports = ports.Distinct().ToList();
+        // 命令列 --output 覆寫 logDir
+        if (cliOutput != null)
+            options.LogDir = cliOutput;
 
         // ── 驗證連接埠 ──
         foreach (var port in ports)
@@ -107,9 +134,21 @@ static class Program
             }
         }
 
+        // 參數合理性檢查
+        if (options.MaxConcurrentSessions < 1)
+        {
+            Console.Error.WriteLine("[錯誤] maxConcurrentSessions 必須 >= 1");
+            return 1;
+        }
+        if (options.MaxPacketBytes < 512 || options.MaxPacketBytes > 8 * 1024 * 1024)
+        {
+            Console.Error.WriteLine("[錯誤] maxPacketBytes 需在 512 ~ 8MB 之間");
+            return 1;
+        }
+
         try
         {
-            var server = new HoneypotServer(ports, output);
+            var server = new HoneypotServer(options);
             await server.RunAsync();
         }
         catch (Exception ex)
@@ -134,11 +173,4 @@ static class Program
         }
         return result;
     }
-}
-
-/// <summary>設定檔結構 (JSON)</summary>
-class AppConfig
-{
-    public List<int>? Ports { get; set; }
-    public string? LogDir { get; set; }
 }

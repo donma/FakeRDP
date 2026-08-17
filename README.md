@@ -19,6 +19,14 @@
 - **完整擷取資訊**：來源 IP、來源連接埠、目標連接埠、帳號、密碼、網域、Cookie、時間戳
 - **Console 即時顯示**：成功擷取憑證時以紅字顯示在終端機
 - **雙檔記錄**：JSONL 匯總檔 + 每 session 獨立目錄（文字日誌 + 原始封包）
+- **資源保護（高併發防耗盡）**：
+  - 全域 Session 上限（`SessionLimiter`，預設 2000 併發）
+  - Per-IP / Per-/24 併發限制（`IpConnectionTracker`，預設 8 / 150）
+  - 超過限制時自動降級為**輕量回應**：仍回應 X.224 CC（讓掃描器看到 RDP banner），但不再投入 TLS / 記憶體 / 磁碟資源
+  - Lazy 建檔：只有進入深度處理的連線才建立 session 目錄
+  - Packet 硬限制：TPKT ≤ 256 KB、DER 長度上限，惡意超大宣告立即關閉
+  - Per-state Timeout：X.224=3s、TLS=5s、MCS=5s、Idle=20s（Slowloris 防護）
+  - Raw capture 預設關閉（`enableRawCapture: false`），避免磁碟反壓
 - **安全防護機制**：拒絕監聽 `3389`（正常 Windows RDP）、`3388` 與所有低於 `1024` 的系統連接埠，確保不與正式服務衝突
 - **零系統侵入**：不改寫 Windows 服務、防火牆規則或登錄檔
 
@@ -89,16 +97,43 @@ RdpHoneypot.exe --port 4499,4500,4501 --output D:\honeypot-logs
 
 ```json
 {
-  "ports": [4499, 4500, 4501]
+  "ports": [4499, 4500, 4501],
+  "maxConcurrentSessions": 2000,
+  "maxConcurrentPerIp": 8,
+  "maxConcurrentPerSubnet": 150,
+  "maxPacketBytes": 262144,
+  "maxRawCaptureBytesPerSession": 4194304,
+  "x224TimeoutSeconds": 3,
+  "tlsTimeoutSeconds": 5,
+  "mcsTimeoutSeconds": 5,
+  "credSspTimeoutSeconds": 10,
+  "idleTimeoutSeconds": 20,
+  "eventQueueCapacity": 100000,
+  "enableRawCapture": false,
+  "logDir": null
 }
 ```
 
-| 欄位 | 型別 | 說明 |
-|------|------|------|
-| `ports` | 整數陣列 | 要監聽的連接埠清單。禁止使用 3389、3388 及 <1024 的連接埠 |
-| `logDir` | 字串 | 記錄輸出目錄（省略時 = exe 所在目錄） |
+| 欄位 | 型別 | 預設值 | 說明 |
+|------|------|--------|------|
+| `ports` | 整數陣列 | `[4499, 4500, 4501]` | 要監聽的連接埠清單。禁止使用 3389、3388 及 <1024 的連接埠 |
+| `maxConcurrentSessions` | 整數 | `2000` | 全域最大深度連線數（超過則走輕量回應） |
+| `maxConcurrentPerIp` | 整數 | `8` | 單一 IP 最大深度連線數 |
+| `maxConcurrentPerSubnet` | 整數 | `150` | 單一 /24 subnet 最大深度連線數 |
+| `maxPacketBytes` | 整數 | `262144` | 單一封包最大 byte 數（超過立即關閉） |
+| `maxRawCaptureBytesPerSession` | 整數 | `4194304` | 每 session raw capture 上限（啟用時） |
+| `x224TimeoutSeconds` | 整數 | `3` | X.224 階段讀取逾時 |
+| `tlsTimeoutSeconds` | 整數 | `5` | TLS 握手逾時 |
+| `mcsTimeoutSeconds` | 整數 | `5` | MCS 階段讀取逾時 |
+| `credSspTimeoutSeconds` | 整數 | `10` | CredSSP/NTLM 階段逾時 |
+| `idleTimeoutSeconds` | 整數 | `20` | 其他階段閒置逾時 |
+| `eventQueueCapacity` | 整數 | `100000` | 事件佇列容量（預留 Wave 2 使用） |
+| `enableRawCapture` | 布林 | `false` | 是否記錄原始封包（預設關閉，避免磁碟反壓） |
+| `logDir` | 字串或 null | `null` | 記錄輸出目錄（null = exe 所在目錄） |
 
 > **注意**：JSON 中 Windows 絕對路徑的反斜線必須跳脫（`"D:\\logs"`）或改用正斜線（`"D:/logs"`）。
+
+> **資源降級行為**：當 `maxConcurrentSessions`、`maxConcurrentPerIp` 或 `maxConcurrentPerSubnet` 任一達上限時，新連線仍會收到 X.224 Connection Confirm（掃描器看到 RDP 服務），但不會繼續 TLS/MCS/Info PDU 處理，也不會建立 session 目錄或寫入任何檔案。
 
 ---
 
@@ -109,9 +144,9 @@ RdpHoneypot.exe --port 4499,4500,4501 --output D:\honeypot-logs
 ├── honeypot.log                  # 啟動/停止紀錄
 ├── captured_creds.jsonl          # 所有成功擷取的憑證（JSONL，每行一筆）
 ├── nla_accounts.jsonl            # NLA 路徑擷取的帳號（含網域與 IP）
-└── session_000001/
+└── session_000001/               # 僅深度連線建立（lazy）
     ├── session.log               # 該連線的協定階段文字紀錄
-    ├── raw.bin                   # 原始封包資料（除錯用）
+    ├── raw.bin                   # 原始封包資料（僅 enableRawCapture=true）
     ├── credential.json           # 標準/TLS 路徑擷取的憑證（若成功）
     └── nla_credential.json       # NLA 路徑擷取的帳號/密碼（若成功）
 ```
@@ -232,7 +267,9 @@ RdpHoneypot.exe --port 4499,4500,4501 --output D:\honeypot-logs
 
 ### 關鍵技術重點
 
-1. **Windows Schannel 相容性**：.NET 產生的記憶體金鑰無法直接被 Schannel 存取，導致 `platform does not support ephemeral keys` 錯誤。解法是將自簽憑證匯出為 PFX 後，以 `X509KeyStorageFlags.PersistKeySet` 重新載入，註冊到 Windows 金鑰存放區。
+1. **階層式 Session 資源保護**：每條連線分為**輕量路徑**（Tier 0/1）與**深度路徑**（Tier 2+）。輕量路徑只做 TCP accept + X.224 CC 回應（成本極低，讓掃描器看到 RDP 服務），深度路徑才做 TLS、MCS、Info PDU 解析。`SessionLimiter`（全域 SemaphoreSlim）與 `IpConnectionTracker`（Per-IP / /24 限制）共同控制深度路徑的准入，超限連線自動走輕量路徑，確保攻擊者消耗的成本遠高於蜜罐。
+
+2. **Windows Schannel 相容性**：.NET 產生的記憶體金鑰無法直接被 Schannel 存取，導致 `platform does not support ephemeral keys` 錯誤。解法是將自簽憑證匯出為 PFX 後，以 `X509KeyStorageFlags.PersistKeySet` 重新載入，註冊到 Windows 金鑰存放區。
 
 2. **RDP 協商位元**：`RDP_NEG_REQ.requestedProtocols` 的位元定義為 `0x01=Standard`、`0x02=TLS`、`0x04=NLA (HYBRID)`。選擇協定時依此正確對應，避免把 TLS 誤判為 NLA。
 

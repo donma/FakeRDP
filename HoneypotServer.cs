@@ -11,12 +11,12 @@ namespace RdpHoneypot;
 /// <summary>
 /// 防禦型 RDP 蜜罐 ─ 僅限在您擁有或授權的網路上使用。
 /// 攔截攻擊者連線，記錄 IP、嘗試的帳號密碼，並存檔。
-/// 
+///
 /// 參考: RDPy (Python honeypot), MS-RDPBCGR 協定規格
 /// </summary>
 sealed class HoneypotServer
 {
-    readonly IReadOnlyList<int> _ports;
+    readonly HoneypotOptions _options;
     readonly string _logDir;
     readonly X509Certificate2 _serverCert;   // RSA 憑證 (內嵌 MCS Response，RDP 安全交換)
     readonly X509Certificate2 _tlsCert;      // RSA 憑證 (TLS 握手 + CredSSP TSCredentials 解密)
@@ -24,13 +24,15 @@ sealed class HoneypotServer
     readonly RSA _tlsRsaKey;                 // TLS 憑證的 RSA 私鑰 (用於 CredSSP 解密)
     readonly byte[] _serverRandom;
 
+    SessionLimiter? _limiter;
+    IpConnectionTracker? _tracker;
     long _sessionCounter;
 
-    public HoneypotServer(IReadOnlyList<int> ports, string logDir)
+    public HoneypotServer(HoneypotOptions options)
     {
-        _ports = ports;
-        _logDir = logDir;
-        Directory.CreateDirectory(logDir);
+        _options = options;
+        _logDir = options.LogDir ?? AppContext.BaseDirectory;
+        Directory.CreateDirectory(_logDir);
 
         // 產生 RSA 2048-bit 金鑰 + 自簽憑證 (供 RDP 安全協商使用)
         (_rsaKey, _serverCert) = CryptoHelper.CreateRsaCert();
@@ -42,11 +44,18 @@ sealed class HoneypotServer
 
     public async Task RunAsync(CancellationToken ct = default)
     {
+        // 建立資源控制器
+        using var tracker = new IpConnectionTracker(
+            _options.MaxConcurrentPerIp, _options.MaxConcurrentPerSubnet);
+        var limiter = new SessionLimiter(_options.MaxConcurrentSessions);
+        _tracker = tracker;
+        _limiter = limiter;
+
         // 為每個連接埠建立監聽器
         var listeners = new List<TcpListener>();
         try
         {
-            foreach (var port in _ports)
+            foreach (var port in _options.Ports)
             {
                 var listener = new TcpListener(IPAddress.Any, port);
                 listener.Start();
@@ -64,15 +73,18 @@ sealed class HoneypotServer
         Console.WriteLine(@$"
 ╔══════════════════════════════════════════════════╗
 ║     RDP Honeypot (防禦型蜜罐)                     ║
-║     Listening on ports: {string.Join(", ", _ports)}     ║
+║     Listening on ports: {string.Join(", ", _options.Ports)}     ║
 ║     Log dir: {Path.GetFullPath(_logDir)} ║
+║     Max sessions: {_options.MaxConcurrentSessions}              ║
+║     Max per IP: {_options.MaxConcurrentPerIp}                     ║
+║     Raw capture: {(_options.EnableRawCapture ? "ON" : "OFF")}                   ║
 ║     ⚠ 僅限在您擁有或授權的網路上使用               ║
 ║     ✓ 不影響正常 RDP (3389)                       ║
 ╚══════════════════════════════════════════════════╝
 ");
 
         await File.AppendAllTextAsync(Path.Combine(_logDir, "honeypot.log"),
-            $"=== Honeypot started on ports [{string.Join(", ", _ports)}] at {DateTime.UtcNow:O} ===\n", ct);
+            $"=== Honeypot started on ports [{string.Join(", ", _options.Ports)}] at {DateTime.UtcNow:O} ===\n", ct);
 
         // 每個監聽器獨立接受連線 (並行)
         var acceptTasks = listeners.Select(l => AcceptLoopAsync(l, ct)).ToArray();
@@ -115,63 +127,84 @@ sealed class HoneypotServer
 
     async Task HandleSessionAsync(long id, IPEndPoint ep, int localPort, TcpClient client, CancellationToken ct)
     {
-        var sessionDir = Path.Combine(_logDir, $"session_{id:D6}");
-        Directory.CreateDirectory(sessionDir);
-
-        var rawLog = new FileStream(Path.Combine(sessionDir, "raw.bin"), FileMode.Create, FileAccess.Write);
-        var textLog = new StreamWriter(Path.Combine(sessionDir, "session.log"), false, Encoding.UTF8) { AutoFlush = true };
-
-        await LogText(textLog, $"Session {id} from {ep} -> port {localPort} at {DateTime.UtcNow:O}");
+        StreamWriter? textLog = null;
+        FileStream? rawLog = null;
+        long rawBytesWritten = 0;
+        bool admitted = false;
 
         try
         {
             using (client)
-            using (rawLog)
-            using (textLog)
             {
                 var rawStream = client.GetStream();
-                rawStream.ReadTimeout = 15000;
-                rawStream.WriteTimeout = 5000;
 
-                Stream stream = rawStream;
-                var state = new RdpSessionState();
-
-                // ── Phase 1: X.224 Connection Request ──
-                var x224 = await ReadTpktAsync(rawStream, rawLog, ct);
-                if (x224 == null) { await LogText(textLog, "  (client disconnected before X.224)"); return; }
-
-                await LogText(textLog, $"  ([{SessionPhase.WaitX224}] RX {x224.Length} bytes)");
+                // ── Phase 1: X.224 Connection Request (Tier 0/1 — 免費) ──
+                var x224 = await ReadTpktAsync(rawStream, null, ct,
+                    _options.X224TimeoutSeconds * 1000);
+                if (x224 == null) return;
 
                 // 解析 client 是否要求協商 (NEG_REQ)
                 var clientProtocols = RdpPacket.TryParseNegotiationRequest(x224);
                 bool useNla = (clientProtocols & 0x02) != 0;
                 bool useTls = (clientProtocols & 0x01) != 0;
                 bool useSecureChannel = useTls || useNla;
-                state.UseNla = useNla;
 
-                // 提取 cookie
-                if (x224.Length > 11)
+                var state = new RdpSessionState
                 {
-                    state.ClientInfo = $"cookie='{Encoding.ASCII.GetString(x224, 11, x224.Length - 11).TrimEnd('\0')}'";
-                }
+                    UseNla = useNla,
+                    ClientInfo = x224.Length > 11
+                        ? $"cookie='{Encoding.ASCII.GetString(x224, 11, x224.Length - 11).TrimEnd('\0')}'"
+                        : null
+                };
 
-                // 回應 X.224 CC (含或不含 NEG_RSP)
-                // Prefer CredSSP/NLA when the client advertises it; otherwise use SSL.
+                // 回應 X.224 CC (含或不含 NEG_RSP) — 永遠回應，讓 scanner 看到 RDP banner
                 uint selectedProtocol = useNla ? 0x02u : 0x01u;
                 var cc = RdpPacket.BuildX224ConnectionConfirm(useSecureChannel, selectedProtocol);
-                await LogText(textLog, $"  ([{SessionPhase.WaitX224}] TX {cc.Length} bytes{(useNla ? ", CredSSP/NLA" : useTls ? ", SSL/TLS" : ", standard")})");
-                await rawLog.WriteAsync(BitConverter.GetBytes(IPAddress.HostToNetworkOrder(cc.Length)), ct);
-                await rawLog.WriteAsync(cc, ct);
-                await rawLog.FlushAsync(ct);
                 await rawStream.WriteAsync(cc, ct);
 
+                // ── Admission Control ──
+                // 超過 global 或 per-IP 限制時，仍走輕量 X.224 回應（已送出），
+                // 但不繼續深度處理（TLS / MCS / Info PDU）。
+                var limiter = _limiter!;
+                var tracker = _tracker!;
+                admitted = limiter.TryEnter() && tracker.TryAcquire(ep.Address);
+
+                if (!admitted)
+                {
+                    // 輕量回應：X.224 CC 已送出，scanner 已看到 RDP 服務
+                    Console.WriteLine($"  [{id}] Lightweight: admission limit reached, X.224 CC sent");
+                    return;
+                }
+
+                // ── 深度處理：延遲建立 session 目錄與檔案 ──
+                var sessionDir = Path.Combine(_logDir, $"session_{id:D6}");
+                Directory.CreateDirectory(sessionDir);
+                textLog = new StreamWriter(Path.Combine(sessionDir, "session.log"),
+                    false, Encoding.UTF8) { AutoFlush = true };
+
+                if (_options.EnableRawCapture)
+                {
+                    rawLog = new FileStream(Path.Combine(sessionDir, "raw.bin"),
+                        FileMode.Create, FileAccess.Write);
+                }
+
+                await LogText(textLog,
+                    $"Session {id} from {ep} -> port {localPort} at {DateTime.UtcNow:O}");
+                await LogText(textLog,
+                    $"  ([{SessionPhase.WaitX224}] RX {x224.Length} bytes)");
+                await LogText(textLog,
+                    $"  ([{SessionPhase.WaitX224}] TX {cc.Length} bytes" +
+                    $"{(useNla ? ", CredSSP/NLA" : useTls ? ", SSL/TLS" : ", standard")})");
+
                 // ── Phase 2: TLS 握手 (如果 client 要求) ──
+                Stream stream = rawStream;
                 if (useSecureChannel)
                 {
                     try
                     {
-                        // ECDSA 憑證 + TLS 1.2 (ECDHE 金鑰交換)
-                        // 注意: 不要嘗試降級 — 失敗後重試會導致 stream 狀態不一致
+                        using var tlsCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        tlsCts.CancelAfter(_options.TlsTimeoutSeconds * 1000);
+
                         var ssl = new SslStream(rawStream, true);
                         var certContext = SslStreamCertificateContext.Create(_tlsCert, null);
                         await ssl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
@@ -180,25 +213,28 @@ sealed class HoneypotServer
                             EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls12,
                             ClientCertificateRequired = false,
                             CertificateRevocationCheckMode = X509RevocationMode.NoCheck
-                        });
+                        }, tlsCts.Token);
                         stream = ssl;
                         state.UseTls = true;
-                        await LogText(textLog, $"  (TLS handshake established: {ssl.NegotiatedCipherSuite})");
+                        await LogText(textLog,
+                            $"  (TLS handshake established: {ssl.NegotiatedCipherSuite})");
                     }
                     catch (Exception ex)
                     {
-                        await LogText(textLog, $"  (!) TLS handshake failed: {ex.Message}");
+                        await LogText(textLog,
+                            $"  (!) TLS handshake failed: {ex.Message}");
                         state.Phase = SessionPhase.Error;
                     }
                 }
 
-// CredSSP runs inside TLS before the MCS Connect Initial.
+                // ── NLA / CredSSP (inside TLS) ──
                 if (useNla && state.Phase != SessionPhase.Error)
                 {
                     var creds = await HandleNlaCredentialsAsync(stream, ct, textLog);
                     if (creds != null)
                     {
-                        await SaveNlaCredentialAsync(id, ep, localPort, creds.Value.domain, creds.Value.username, creds.Value.password, ct);
+                        await SaveNlaCredentialAsync(id, ep, localPort,
+                            creds.Value.domain, creds.Value.username, creds.Value.password, ct);
                         var msg = creds.Value.password != null
                             ? $"  >>> NLA credential: {creds.Value.domain}\\{creds.Value.username}:{creds.Value.password}"
                             : $"  >>> NLA account: {creds.Value.domain}\\{creds.Value.username}";
@@ -208,7 +244,7 @@ sealed class HoneypotServer
                     state.Phase = SessionPhase.Done;
                 }
 
-                // ── Phase 3+: 主循環 (MCS 握手 → 安全交換 → Info PDU) ──
+                // ── Phase 3+: 主循環 (MCS → 安全交換 → Info PDU) ──
                 if (!useNla)
                     state.Phase = SessionPhase.WaitMCS;
 
@@ -216,19 +252,44 @@ sealed class HoneypotServer
                        state.Phase != SessionPhase.Error &&
                        state.Phase != SessionPhase.Done)
                 {
-                    var tpkt = await ReadTpktAsync(stream, rawLog, ct);
+                    // 根據目前階段設定讀取 timeout
+                    int phaseTimeoutMs = _options.IdleTimeoutSeconds * 1000;
+                    if (state.Phase == SessionPhase.WaitMCS ||
+                        state.Phase == SessionPhase.WaitErectDomain ||
+                        state.Phase == SessionPhase.WaitAttachUser ||
+                        state.Phase == SessionPhase.WaitChannelJoin)
+                        phaseTimeoutMs = _options.McsTimeoutSeconds * 1000;
+                    else if (state.Phase == SessionPhase.WaitSecurityExchange ||
+                             state.Phase == SessionPhase.WaitInfo)
+                        phaseTimeoutMs = _options.IdleTimeoutSeconds * 1000;
+
+                    var tpkt = await ReadTpktAsync(stream, rawLog, ct, phaseTimeoutMs);
                     if (tpkt == null) break;
 
-                    await LogText(textLog, $"  ([{state.Phase}] RX {tpkt.Length} bytes)");
+                    // 更新 raw capture 進度
+                    if (rawLog != null)
+                        rawBytesWritten += tpkt.Length;
+
+                    await LogText(textLog,
+                        $"  ([{state.Phase}] RX {tpkt.Length} bytes)");
 
                     var response = await ProcessPacketAsync(state, tpkt);
 
                     if (response != null)
                     {
-                        await LogText(textLog, $"  ([{state.Phase}] TX {response.Length} bytes)");
-                        await rawLog.WriteAsync(BitConverter.GetBytes(IPAddress.HostToNetworkOrder(response.Length)), ct);
-                        await rawLog.WriteAsync(response, ct);
-                        await rawLog.FlushAsync(ct);
+                        await LogText(textLog,
+                            $"  ([{state.Phase}] TX {response.Length} bytes)");
+
+                        // 寫入 raw capture (有上限)
+                        if (rawLog != null && rawBytesWritten < _options.MaxRawCaptureBytesPerSession)
+                        {
+                            await rawLog.WriteAsync(
+                                BitConverter.GetBytes(IPAddress.HostToNetworkOrder(response.Length)), ct);
+                            await rawLog.WriteAsync(response, ct);
+                            await rawLog.FlushAsync(ct);
+                            rawBytesWritten += 4 + response.Length;
+                        }
+
                         await stream.WriteAsync(response, ct);
                         await Task.Delay(100, ct);
                     }
@@ -236,7 +297,8 @@ sealed class HoneypotServer
                     // 檢查憑證擷取
                     if (state.Credential != null)
                     {
-                        await LogText(textLog, $"  >>> CAPTURED credential: {state.Credential}");
+                        await LogText(textLog,
+                            $"  >>> CAPTURED credential: {state.Credential}");
                         await SaveCredentialAsync(id, ep, localPort, state.Credential, ct);
                         state.Credential = null;
                     }
@@ -246,22 +308,38 @@ sealed class HoneypotServer
                 }
             }
         }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine($"  [{id}] Timeout, closing session");
+        }
         catch (Exception ex)
         {
-            await LogText(textLog, $"  [!] Error: {ex.Message}");
-            Console.WriteLine($"[{id}] ! Error: {ex.Message}");
+            Console.WriteLine($"  [{id}] ! Error: {ex.Message}");
         }
+        finally
+        {
+            // 確保配額歸還
+            if (admitted)
+            {
+                _limiter?.Exit();
+                _tracker?.Release(ep.Address);
+            }
 
-        await LogText(textLog, $"Session {id} ended at {DateTime.UtcNow:O}");
-        Console.WriteLine($"[{id}] - Connection closed");
+            if (textLog != null)
+            {
+                await textLog.WriteLineAsync($"Session {id} ended at {DateTime.UtcNow:O}");
+                textLog.Close();
+            }
+            rawLog?.Close();
+        }
     }
 
-/// <summary>
+    /// <summary>
     /// NLA 完整流程：NTLM Type 1/2/3 → SPNEGO accept → TSCredentials 解密
     /// 記錄 domain/username/password（不保存 NTLM hash）
     /// </summary>
     async Task<(string domain, string username, string? password)?> HandleNlaCredentialsAsync(
-        Stream stream, CancellationToken ct, StreamWriter textLog)
+        Stream stream, CancellationToken ct, StreamWriter? textLog)
     {
         for (var attempt = 0; attempt < 4 && !ct.IsCancellationRequested; attempt++)
         {
@@ -338,12 +416,10 @@ sealed class HoneypotServer
     /// <summary>從 TSRequest DER 中提取 [2] authInfo OCTET STRING 的內容</summary>
     static byte[]? ExtractAuthInfo(byte[] tsRequest)
     {
-        // 簡單搜尋：找 0xA2 (context-specific tag 2, constructed) 後跟長度，再跟 0x04 (OCTET STRING)
         for (var i = 0; i < tsRequest.Length - 2; i++)
         {
             if (tsRequest[i] == 0xA2)
             {
-                // 解析長度
                 int lenStart = i + 1;
                 int contentLen;
                 int dataStart;
@@ -362,7 +438,6 @@ sealed class HoneypotServer
                     dataStart = lenStart + 1 + numBytes;
                 }
 
-                // 內部應有 0x04 (OCTET STRING)
                 if (dataStart < tsRequest.Length && tsRequest[dataStart] == 0x04)
                 {
                     int octetLenStart = dataStart + 1;
@@ -401,14 +476,11 @@ sealed class HoneypotServer
     {
         try
         {
-            // 前 256 bytes = 加密的 TSCredentialsKey (RSA-2048)
             var encryptedKey = authInfo[..256];
             var encryptedData = authInfo[256..];
 
-            // RSA-OAEP-SHA256 解密
             var tsCredsKey = rsaKey.Decrypt(encryptedKey, RSAEncryptionPadding.OaepSHA256);
 
-            // 衍生 AES key + IV
             var label = "CredSSP1"u8.ToArray();
             var material = new byte[tsCredsKey.Length + label.Length];
             Array.Copy(tsCredsKey, material, tsCredsKey.Length);
@@ -418,7 +490,6 @@ sealed class HoneypotServer
             var aesKey = hash[..16];
             var aesIv = hash[16..32];
 
-            // AES-128-CBC 解密
             using var aes = Aes.Create();
             aes.Key = aesKey;
             aes.IV = aesIv;
@@ -428,7 +499,6 @@ sealed class HoneypotServer
             using var decryptor = aes.CreateDecryptor();
             var decrypted = decryptor.TransformFinalBlock(encryptedData, 0, encryptedData.Length);
 
-            // 解析 TSPasswordCreds
             return ParseTSPasswordCreds(decrypted);
         }
         catch (Exception ex)
@@ -438,27 +508,12 @@ sealed class HoneypotServer
         }
     }
 
-    /// <summary>
-    /// 解析 TSCredentials ASN.1 → TSPasswordCreds
-    /// TSCredentials ::= SEQUENCE {
-    ///   credType    [0] INTEGER,
-    ///   credentials [1] OCTET STRING  -- TSPasswordCreds
-    /// }
-    /// TSPasswordCreds ::= SEQUENCE {
-    ///   domainName  [0] OCTET STRING,
-    ///   userName    [1] OCTET STRING,
-    ///   password    [2] OCTET STRING
-    /// }
-    /// </summary>
     static string? ParseTSPasswordCreds(byte[] der)
     {
-        // 非常簡易的 ASN.1 解析：找到 [2] OCTET STRING 的內容
-        // 依序搜尋 0xA0, 0xA1, 0xA2 context tags
         var password = FindContextOctetString(der, 0x02);
         return password != null ? Encoding.Unicode.GetString(password).TrimEnd('\0') : null;
     }
 
-    /// <summary>在 DER 中搜尋 context tag [n] 內的 OCTET STRING 內容</summary>
     static byte[]? FindContextOctetString(byte[] data, int contextTag)
     {
         var tag = (byte)(0xA0 | contextTag);
@@ -484,7 +539,6 @@ sealed class HoneypotServer
                     contentStart = lenStart + 1 + numBytes;
                 }
 
-                // 內容應為 0x04 (OCTET STRING) 或直接是內容
                 if (contentStart < data.Length && data[contentStart] == 0x04)
                 {
                     int olStart = contentStart + 1;
@@ -512,15 +566,11 @@ sealed class HoneypotServer
         return null;
     }
 
-    /// <summary>建構 SPNEGO accept-completed 包在 TSRequest 中</summary>
     static byte[] BuildSpnegoAcceptResponse()
     {
-        // SPNEGO NegTokenResp: SEQUENCE { [0] ENUMERATED 0 (accept-completed) }
-        // Without mechListMIC (may work on some clients)
-        var negResult = Der(0xA0, [0x0A, 0x01, 0x00]); // [0] ENUMERATED 0
-        var spnego = Der(0x30, negResult); // NegTokenResp
+        var negResult = Der(0xA0, [0x0A, 0x01, 0x00]);
+        var spnego = Der(0x30, negResult);
 
-        // 包在 TSRequest 的 negoTokens 中
         var octet = Der(0x04, spnego);
         var token = Der(0xA0, octet);
         var item = Der(0x30, token);
@@ -530,7 +580,6 @@ sealed class HoneypotServer
         return Der(0x30, [.. version, .. negoTokens]);
     }
 
-    /// <summary>儲存 NLA 帳號 + 密碼</summary>
     async Task SaveNlaCredentialAsync(
         long id, IPEndPoint ep, int localPort, string domain, string username, string? password, CancellationToken ct)
     {
@@ -563,7 +612,7 @@ sealed class HoneypotServer
         }
     }
 
-    static async Task<byte[]?> ReadDerMessageAsync(Stream stream, CancellationToken ct)
+    async Task<byte[]?> ReadDerMessageAsync(Stream stream, CancellationToken ct)
     {
         var first = new byte[2];
         if (!await ReadExactlyAsync(stream, first, ct)) return null;
@@ -582,7 +631,9 @@ sealed class HoneypotServer
             foreach (var b in extended) length = (length << 8) | b;
         }
 
-        if (length > 1024 * 1024) return null;
+        // 硬限制：不得超過 MaxPacketBytes
+        if (length > _options.MaxPacketBytes) return null;
+
         var body = new byte[length];
         if (!await ReadExactlyAsync(stream, body, ct)) return null;
         return [first[0], .. lengthBytes, .. body];
@@ -626,7 +677,6 @@ sealed class HoneypotServer
         var fieldOffset = ntlmOffset + relativeFieldOffset;
         if (fieldOffset < 0 || fieldOffset + 8 > message.Length) return null;
         var length = message[fieldOffset] | (message[fieldOffset + 1] << 8);
-        // NTLM security-buffer offsets are relative to the NTLMSSP message start.
         var offset = ntlmOffset + (int)ReadUInt32LE(message, fieldOffset + 4);
         if (length == 0 || offset < 0 || offset + length > message.Length || (length & 1) != 0)
             return null;
@@ -644,7 +694,7 @@ sealed class HoneypotServer
             av.Write((ushort)workstation.Length);
             av.Write(workstation);
         }
-        av.Write((ushort)0); // MsvAvEOL
+        av.Write((ushort)0);
         av.Write((ushort)0);
 
         var targetInfo = avPairs.ToArray();
@@ -652,13 +702,12 @@ sealed class HoneypotServer
         var ntlm = new byte[targetInfoOffset + targetInfo.Length];
         var signature = Encoding.ASCII.GetBytes("NTLMSSP\0");
         Array.Copy(signature, ntlm, signature.Length);
-        WriteUInt32LE(ntlm, 8, 2); // CHALLENGE_MESSAGE
+        WriteUInt32LE(ntlm, 8, 2);
         WriteUInt16LE(ntlm, 12, (ushort)workstation.Length);
         WriteUInt16LE(ntlm, 14, (ushort)workstation.Length);
         WriteUInt32LE(ntlm, 16, 0x38);
         WriteUInt32LE(ntlm, 20, 0xE28A8215);
         RandomNumberGenerator.Fill(ntlm.AsSpan(24, 8));
-        // reserved[8] remains zero
         WriteUInt16LE(ntlm, 40, (ushort)targetInfo.Length);
         WriteUInt16LE(ntlm, 42, (ushort)targetInfo.Length);
         WriteUInt32LE(ntlm, 44, (uint)targetInfoOffset);
@@ -668,7 +717,6 @@ sealed class HoneypotServer
         Array.Copy(workstation, 0, ntlm, 0x38, workstation.Length);
         Array.Copy(targetInfo, 0, ntlm, targetInfoOffset, targetInfo.Length);
 
-        // TSRequest with version=5 and negoTokens containing the NTLM challenge.
         var octet = Der(0x04, ntlm);
         var token = Der(0xA0, octet);
         var item = Der(0x30, token);
@@ -703,35 +751,45 @@ sealed class HoneypotServer
         data[offset + 3] = (byte)(value >> 24);
     }
 
-    /// <summary>讀取一個完整的 TPKT 封包 (支援泛用 Stream)</summary>
-    static async Task<byte[]?> ReadTpktAsync(Stream stream, FileStream rawLog, CancellationToken ct)
+    /// <summary>讀取一個完整的 TPKT 封包 (支援泛用 Stream)，含硬限制與 timeout</summary>
+    static async Task<byte[]?> ReadTpktAsync(Stream stream, FileStream? rawLog,
+        CancellationToken ct, int timeoutMs = 0)
     {
-        // TPKT header: 4 bytes (version, reserved, length big-endian)
+        using var timeoutCts = timeoutMs > 0
+            ? CancellationTokenSource.CreateLinkedTokenSource(ct)
+            : null;
+        if (timeoutCts != null)
+            timeoutCts.CancelAfter(timeoutMs);
+        var linkedCt = timeoutCts?.Token ?? ct;
+
+        // TPKT header: 4 bytes
         var header = new byte[4];
         int read = 0;
         while (read < 4)
         {
-            int n = await stream.ReadAsync(header, read, 4 - read, ct);
+            int n = await stream.ReadAsync(header.AsMemory(read, 4 - read), linkedCt);
             if (n == 0) return null;
             read += n;
         }
 
-        await rawLog.WriteAsync(header, ct);
+        if (rawLog != null)
+            await rawLog.WriteAsync(header, ct);
 
         int length = (header[2] << 8) | header[3];
-        if (length < 4) return null;
+        // 硬限制：TPKT 長度必須合理 (4~262144 bytes)
+        if (length < 4 || length > 262_144) return null;
 
         var body = new byte[length - 4];
         read = 0;
         while (read < body.Length)
         {
-            int n = await stream.ReadAsync(body, read, body.Length - read, ct);
+            int n = await stream.ReadAsync(body.AsMemory(read, body.Length - read), linkedCt);
             if (n == 0) return null;
             read += n;
         }
 
-        await rawLog.WriteAsync(body, ct);
-        await rawLog.FlushAsync(ct);
+        if (rawLog != null)
+            await rawLog.WriteAsync(body, ct);
 
         return [.. header, .. body];
     }
@@ -754,38 +812,31 @@ sealed class HoneypotServer
     /// <summary>MCS Erect Domain Request → 不回應，直接進下一個階段</summary>
     byte[]? HandleErectDomainRequest(RdpSessionState state, byte[] packet)
     {
-        // 確認是 Erect Domain Request (0x04)
         if (packet.Length < 8 || packet[7] != 0x04)
         {
-            // 不是 Erect Domain Request，可能 client 直接跳過了
-            // 把這個封包當作 Attach User Request 重新處理
             state.Phase = SessionPhase.WaitAttachUser;
             return HandleAttachUserRequest(state, packet);
         }
 
-        // Erect Domain Request 不需要回應，直接進 Attach User 階段
         state.Phase = SessionPhase.WaitAttachUser;
-        return null; // 不回傳任何東西
+        return null;
     }
 
     /// <summary>MCS Attach User Request → Attach User Confirm</summary>
     byte[]? HandleAttachUserRequest(RdpSessionState state, byte[] packet)
     {
-        // 確認是 Attach User Request (0x28)
         if (packet.Length < 8 || packet[7] != 0x28)
         {
             state.Phase = SessionPhase.Error;
             return null;
         }
 
-        // 建構 Attach User Confirm:
-        // TPKT(4) + X.224(3) + MCS header(0x2E) + result(1) + user_id(2)
         var confirm = new byte[] {
-            0x03, 0x00, 0x00, 0x0B, // TPKT length 11
-            0x02, 0xF0, 0x80,       // X.224 Data
-            0x2E,                   // MCS AttachUserConfirm, options=2 (end)
-            0x00,                   // result = 0 (success)
-            0x00, 0x01              // user_id = 1002 - 1001 (MCS_BASE_CHANNEL_ID)
+            0x03, 0x00, 0x00, 0x0B,
+            0x02, 0xF0, 0x80,
+            0x2E,
+            0x00,
+            0x00, 0x01
         };
 
         state.Phase = SessionPhase.WaitChannelJoin;
@@ -795,15 +846,12 @@ sealed class HoneypotServer
     /// <summary>MCS Channel Join Request → Channel Join Confirm</summary>
     byte[]? HandleChannelJoinRequest(RdpSessionState state, byte[] packet)
     {
-        // 確認是 Channel Join Request (0x38)
         if (packet.Length < 8 || packet[7] != 0x38)
         {
             state.Phase = SessionPhase.Error;
             return null;
         }
 
-        // 解析 channel_id (從 PER 編碼中)
-        // 格式: 0x38 + initiator(2 bytes) + channel_id(2 bytes)
         if (packet.Length < 12)
         {
             state.Phase = SessionPhase.Error;
@@ -813,49 +861,36 @@ sealed class HoneypotServer
         var requestedChannel = (ushort)((packet[10] << 8) | packet[11]);
         state.ChannelId = requestedChannel;
 
-        // 建構 Channel Join Confirm:
-        // TPKT(4) + X.224(3) + MCS header(0x3E) + result(1) + initiator(2) + requested(2) + channelId(2)
         var confirm = new byte[] {
-            0x03, 0x00, 0x00, 0x0F, // TPKT length 15
-            0x02, 0xF0, 0x80,       // X.224 Data
-            0x3E,                   // MCS ChannelJoinConfirm, options=2 (end)
-            0x00,                   // result = 0 (success)
-            0x00, 0x01,             // initiator = 1002 - 1001
-            (byte)(requestedChannel >> 8), (byte)requestedChannel, // requested channel
-            (byte)(requestedChannel >> 8), (byte)requestedChannel  // assigned channel (same)
+            0x03, 0x00, 0x00, 0x0F,
+            0x02, 0xF0, 0x80,
+            0x3E,
+            0x00,
+            0x00, 0x01,
+            (byte)(requestedChannel >> 8), (byte)requestedChannel,
+            (byte)(requestedChannel >> 8), (byte)requestedChannel
         };
 
-        // 注意：如果 client 有多個 channel 要 join，我們需要繼續等待
-        // 如果 join 的是 global channel (1003)，則進入 Security Exchange 階段
         state.Phase = (requestedChannel == 1003)
             ? SessionPhase.WaitSecurityExchange
-            : SessionPhase.WaitChannelJoin; // 繼續等待其他 channel join
+            : SessionPhase.WaitChannelJoin;
 
         return confirm;
     }
 
-    /// <summary>MCS Connect Initial → 回傳 Connect Response (含 Server 憑證)</summary>
+    /// <summary>MCS Connect Initial → 回傳 Connect Response</summary>
     byte[]? HandleMCSConnectInitial(RdpSessionState state, byte[] packet)
     {
         try
         {
-            // 嘗試從 MCS Connect Initial 中提取 client 資訊
             var info = RdpPacket.ParseMCSConnectInitial(packet);
             state.ClientInfo = string.IsNullOrEmpty(state.ClientInfo)
                 ? info
                 : $"{state.ClientInfo}; {info}";
         }
-        catch { /* 忽略解析失敗 */ }
+        catch { }
 
-        // [DEBUG] 輸出 MCS Connect Initial 內容
-        Console.WriteLine($"  [DBG] MCS Connect Initial: {packet.Length} bytes");
-        Console.WriteLine($"  [DBG] First 80: {Convert.ToHexString(packet[..Math.Min(80, packet.Length)])}");
-
-        // 建構 MCS Connect Response (含 server 憑證與 random)
-        // TLS 模式下不包含 RSA 憑證 (TLS 已提供加密)
         var response = RdpPacket.BuildMCSConnectResponse(_serverCert, _rsaKey, _serverRandom, state.UseTls);
-        Console.WriteLine($"  [DBG] MCS Connect Response built: {response.Length} bytes");
-        Console.WriteLine($"  [DBG] Response first 120: {Convert.ToHexString(response[..Math.Min(120, response.Length)])}");
 
         state.Phase = SessionPhase.WaitErectDomain;
         return response;
@@ -866,36 +901,25 @@ sealed class HoneypotServer
     {
         try
         {
-            // 實際封包結構 (client → server):
-            // TPKT + X.224 Data + MCS Send Data Request (0x64) + RDP security header + payload
-            // TLS 模式下 client 可能直接送 Info PDU (SEC_INFO_PKT)，沒有 Security Exchange
             var payload = RdpPacket.ExtractPayloadForTls(packet);
-            if (payload == null || payload.Length == 0)
+            if (payload != null && payload.Length > 0)
             {
-                // 沒有 payload → 當作標準 Security Exchange (空) 處理
-            }
-            else
-            {
-                // 檢查 RDP security flags
                 var flags = ExtractSecurityFlags(packet);
-                bool isInfoPdu = (flags & 0x0040) != 0; // SEC_INFO_PKT
+                bool isInfoPdu = (flags & 0x0040) != 0;
 
                 if (isInfoPdu)
                 {
-                    // 這是 Info PDU，不是 Security Exchange！
                     await LogInfoPduAsync(packet, state, payload);
                     state.Phase = SessionPhase.Done;
                     return RdpPacket.BuildDataAck();
                 }
 
-                // 標準 Security Exchange: 解密 client random (RSA 2048)
                 var clientRandom = CryptoHelper.DecryptClientRandom(payload, _rsaKey);
 
                 if (clientRandom != null && clientRandom.Length == 32)
                 {
                     state.ClientRandom = clientRandom;
 
-                    // 衍生 RC4 session keys
                     var (decryptKey, encryptKey) = CryptoHelper.DeriveSessionKeys(
                         clientRandom, _serverRandom);
 
@@ -911,32 +935,25 @@ sealed class HoneypotServer
             return null;
         }
 
-        // 回應一個空的 Data Ack (讓 client 繼續)
         var ack = RdpPacket.BuildDataAck();
         state.Phase = SessionPhase.WaitInfo;
         return ack;
     }
 
-    /// <summary>從封包中提取 RDP security header 的 flags (16-bit little-endian)</summary>
     static ushort ExtractSecurityFlags(byte[] packet)
     {
-        // 找 MCS choice byte (0x64 = Send Data Request) 之後的 dataPriority + segmentation
         for (var i = 6; i < packet.Length - 6; i++)
         {
             if (packet[i] == 0x64 && packet[i + 1] != 0xFF)
             {
-                // MCS: choice(1) + initiator(2) + channel(2) + priority(1) + segmentation(1)
                 int p = i + 1 + 2 + 2 + 1 + 1;
                 if (p + 4 <= packet.Length)
-                {
                     return (ushort)(packet[p] | (packet[p + 1] << 8));
-                }
             }
         }
         return 0;
     }
 
-    /// <summary>直接處理 Info PDU payload 並紀錄帳密</summary>
     async Task LogInfoPduAsync(byte[] packet, RdpSessionState state, byte[] payload)
     {
         try
@@ -963,7 +980,7 @@ sealed class HoneypotServer
         }
     }
 
-    /// <summary>Info PDU → 解密並提取帳號密碼 (支援 TLS 明文與 RC4 兩種)</summary>
+    /// <summary>Info PDU → 解密並提取帳號密碼</summary>
     byte[]? HandleInfoPDU(RdpSessionState state, byte[] packet)
     {
         try
@@ -976,10 +993,8 @@ sealed class HoneypotServer
                 return null;
             }
 
-            // 方式 1: 直接當明文解析 (TLS 通道已解密，或未加密)
             var cred = RdpPacket.ParseInfoPDU(payload);
 
-            // 方式 2: 若明文解析失敗且有 RC4 key，嘗試 RC4 解密後再解析
             if (cred == null && state.DecryptKey != null)
             {
                 var decrypted = CryptoHelper.RC4Decrypt(state.DecryptKey, payload);
@@ -1000,14 +1015,14 @@ sealed class HoneypotServer
             Console.WriteLine($"  [!] Info PDU parse error: {ex.Message}");
         }
 
-        // 回應一個 Data Ack (或關閉連線)
         state.Phase = SessionPhase.Done;
         return RdpPacket.BuildDataAck();
     }
 
-    async Task LogText(StreamWriter w, string line)
+    static async Task LogText(StreamWriter? w, string line)
     {
-        await w.WriteLineAsync(line);
+        if (w != null)
+            await w.WriteLineAsync(line);
         Console.WriteLine($"  {line}");
     }
 
@@ -1030,7 +1045,6 @@ sealed class HoneypotServer
         var path = Path.Combine(_logDir, "captured_creds.jsonl");
         await File.AppendAllTextAsync(path, json + "\n", ct);
 
-        // 也存單獨檔案
         var credPath = Path.Combine(_logDir, $"session_{id:D6}", "credential.json");
         await File.WriteAllTextAsync(credPath, json, ct);
 
