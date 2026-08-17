@@ -157,13 +157,13 @@ RdpHoneypot.exe --port 4499,4500,4501 --output D:\honeypot-logs
 {
   "session_id": 3,
   "timestamp": "2026-08-17T05:02:12.6674375Z",
-  "source_ip": "192.168.121.153",
+  "source_ip": "10.0.0.100",
   "source_port": 6263,
   "target_port": 4499,
-  "username": "no2somdej@hotmail.com",
-  "password": "123456",
-  "domain": "",
-  "client_info": "cookie='Cookie: mstshash=no2somdej'"
+  "username": "admin",
+  "password": "P@ssw0rd",
+  "domain": "WORKGROUP",
+  "client_info": "cookie='Cookie: mstshash=admin'"
 }
 ```
 
@@ -173,11 +173,11 @@ RdpHoneypot.exe --port 4499,4500,4501 --output D:\honeypot-logs
 {
   "session_id": 1,
   "timestamp": "2026-08-17T03:35:16.2561128Z",
-  "source_ip": "192.168.121.153",
+  "source_ip": "10.0.0.100",
   "source_port": 13526,
   "target_port": 4499,
   "domain": "",
-  "username": "no2somdej@hotmail.com"
+  "username": "admin"
 }
 ```
 

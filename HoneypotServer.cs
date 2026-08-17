@@ -26,6 +26,7 @@ sealed class HoneypotServer
 
     SessionLimiter? _limiter;
     IpConnectionTracker? _tracker;
+    EventRecorder? _recorder;
     long _sessionCounter;
 
     public HoneypotServer(HoneypotOptions options)
@@ -48,8 +49,11 @@ sealed class HoneypotServer
         using var tracker = new IpConnectionTracker(
             _options.MaxConcurrentPerIp, _options.MaxConcurrentPerSubnet);
         var limiter = new SessionLimiter(_options.MaxConcurrentSessions);
+        // 建立事件管線（背景批次寫 JSONL，Session path 不直接寫檔）
+        using var recorder = new EventRecorder(_options.EventQueueCapacity, _logDir);
         _tracker = tracker;
         _limiter = limiter;
+        _recorder = recorder;
 
         // 為每個連接埠建立監聽器
         var listeners = new List<TcpListener>();
@@ -233,8 +237,8 @@ sealed class HoneypotServer
                     var creds = await HandleNlaCredentialsAsync(stream, ct, textLog);
                     if (creds != null)
                     {
-                        await SaveNlaCredentialAsync(id, ep, localPort,
-                            creds.Value.domain, creds.Value.username, creds.Value.password, ct);
+                        SaveNlaCredentialAsync(id, ep, localPort,
+                            creds.Value.domain, creds.Value.username, creds.Value.password);
                         var msg = creds.Value.password != null
                             ? $"  >>> NLA credential: {creds.Value.domain}\\{creds.Value.username}:{creds.Value.password}"
                             : $"  >>> NLA account: {creds.Value.domain}\\{creds.Value.username}";
@@ -299,7 +303,7 @@ sealed class HoneypotServer
                     {
                         await LogText(textLog,
                             $"  >>> CAPTURED credential: {state.Credential}");
-                        await SaveCredentialAsync(id, ep, localPort, state.Credential, ct);
+                        SaveCredentialAsync(id, ep, localPort, state.Credential);
                         state.Credential = null;
                     }
 
@@ -580,25 +584,22 @@ sealed class HoneypotServer
         return Der(0x30, [.. version, .. negoTokens]);
     }
 
-    async Task SaveNlaCredentialAsync(
-        long id, IPEndPoint ep, int localPort, string domain, string username, string? password, CancellationToken ct)
+    void SaveNlaCredentialAsync(
+        long id, IPEndPoint ep, int localPort, string domain, string username, string? password)
     {
-        var entry = new
+        _recorder?.TryWrite(new HoneypotEvent
         {
-            session_id = id,
-            timestamp = DateTime.UtcNow,
-            source_ip = ep.Address.ToString(),
-            source_port = ep.Port,
-            target_port = localPort,
-            domain,
-            username,
-            password
-        };
-
-        var json = JsonSerializer.Serialize(entry, new JsonSerializerOptions { WriteIndented = true });
-        await File.AppendAllTextAsync(Path.Combine(_logDir, "nla_accounts.jsonl"), json + "\n", ct);
-        await File.WriteAllTextAsync(
-            Path.Combine(_logDir, $"session_{id:D6}", "nla_credential.json"), json, ct);
+            EventType = "nla_credential",
+            SessionId = id,
+            Timestamp = DateTime.UtcNow,
+            SourceIp = ep.Address.ToString(),
+            SourcePort = ep.Port,
+            TargetPort = localPort,
+            Domain = domain,
+            Username = username,
+            Password = password,
+            SessionDir = Path.Combine(_logDir, $"session_{id:D6}")
+        });
 
         if (!string.IsNullOrEmpty(password))
         {
@@ -1026,27 +1027,22 @@ sealed class HoneypotServer
         Console.WriteLine($"  {line}");
     }
 
-    async Task SaveCredentialAsync(long id, IPEndPoint ep, int localPort, CapturedCredential cred, CancellationToken ct)
+    void SaveCredentialAsync(long id, IPEndPoint ep, int localPort, CapturedCredential cred)
     {
-        var entry = new
+        _recorder?.TryWrite(new HoneypotEvent
         {
-            session_id = id,
-            timestamp = DateTime.UtcNow,
-            source_ip = ep.Address.ToString(),
-            source_port = ep.Port,
-            target_port = localPort,
-            username = cred.Username,
-            password = cred.Password,
-            domain = cred.Domain,
-            client_info = cred.ClientInfo
-        };
-
-        var json = JsonSerializer.Serialize(entry, new JsonSerializerOptions { WriteIndented = true });
-        var path = Path.Combine(_logDir, "captured_creds.jsonl");
-        await File.AppendAllTextAsync(path, json + "\n", ct);
-
-        var credPath = Path.Combine(_logDir, $"session_{id:D6}", "credential.json");
-        await File.WriteAllTextAsync(credPath, json, ct);
+            EventType = "credential",
+            SessionId = id,
+            Timestamp = DateTime.UtcNow,
+            SourceIp = ep.Address.ToString(),
+            SourcePort = ep.Port,
+            TargetPort = localPort,
+            Username = cred.Username,
+            Password = cred.Password,
+            Domain = cred.Domain,
+            ClientInfo = cred.ClientInfo,
+            SessionDir = Path.Combine(_logDir, $"session_{id:D6}")
+        });
 
         Console.ForegroundColor = ConsoleColor.Red;
         Console.WriteLine($"  ═══ CREDENTIAL CAPTURED ═══");
