@@ -48,7 +48,40 @@ static class CryptoHelper
     }
 
     /// <summary>
-    /// 產生 ECDSA P-256 自簽憑證
+    /// 產生 RSA 2048-bit 自簽憑證，專門給 TLS 使用
+    /// 使用 PFX + PersistKeySet 重新載入，讓 Schannel/CNG 能存取私鑰
+    /// 此憑證的 RSA 私鑰也可用於 CredSSP TSCredentials 解密
+    /// </summary>
+    public static X509Certificate2 CreateRsaCertForTls()
+    {
+        var rsa = RSA.Create(2048);
+
+        var req = new CertificateRequest(
+            "CN=MS-Server, O=Microsoft Corporation",
+            rsa,
+            HashAlgorithmName.SHA256,
+            RSASignaturePadding.Pkcs1);
+
+        req.CertificateExtensions.Add(
+            new X509KeyUsageExtension(
+                X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment,
+                false));
+
+        req.CertificateExtensions.Add(
+            new X509EnhancedKeyUsageExtension(
+                new OidCollection { new Oid("1.3.6.1.5.5.7.3.1") }, // serverAuth
+                false));
+
+        var tempCert = req.CreateSelfSigned(
+            DateTimeOffset.UtcNow.AddMinutes(-5),
+            DateTimeOffset.UtcNow.AddYears(1));
+
+        // 與 ECDSA 相同技巧：PFX + PersistKeySet 確保 Schannel 可存取私鑰
+        var pfx = tempCert.Export(X509ContentType.Pfx, "honeypot-pw");
+        return X509CertificateLoader.LoadPkcs12(
+            pfx, "honeypot-pw",
+            X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet);
+    }
     /// 用於 TLS 握手 (支援 ECDHE 金鑰交換，Windows Schannel 相容)
     /// 關鍵: 以 PFX + PersistKeySet 重新載入，讓 Schannel/CNG 能存取私鑰
     /// </summary>

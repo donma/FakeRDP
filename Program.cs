@@ -84,7 +84,7 @@ static class Program
         var ports = cliPorts.Count > 0 ? cliPorts : (config?.Ports ?? []);
         if (ports.Count == 0) ports = [4499];
 
-        string output = cliOutput ?? config?.LogDir ?? Path.Combine(AppContext.BaseDirectory, "logs");
+        string output = cliOutput ?? config?.LogDir ?? AppContext.BaseDirectory;
 
         // 去重
         ports = ports.Distinct().ToList();

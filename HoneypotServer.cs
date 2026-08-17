@@ -19,8 +19,9 @@ sealed class HoneypotServer
     readonly IReadOnlyList<int> _ports;
     readonly string _logDir;
     readonly X509Certificate2 _serverCert;   // RSA 憑證 (內嵌 MCS Response，RDP 安全交換)
-    readonly X509Certificate2 _tlsCert;      // ECDSA 憑證 (TLS 握手用)
+    readonly X509Certificate2 _tlsCert;      // RSA 憑證 (TLS 握手 + CredSSP TSCredentials 解密)
     readonly RSA _rsaKey;
+    readonly RSA _tlsRsaKey;                 // TLS 憑證的 RSA 私鑰 (用於 CredSSP 解密)
     readonly byte[] _serverRandom;
 
     long _sessionCounter;
@@ -33,8 +34,9 @@ sealed class HoneypotServer
 
         // 產生 RSA 2048-bit 金鑰 + 自簽憑證 (供 RDP 安全協商使用)
         (_rsaKey, _serverCert) = CryptoHelper.CreateRsaCert();
-        // 產生 ECDSA 自簽憑證 (供 TLS 握手使用，支援 ECDHE)
-        _tlsCert = CryptoHelper.CreateEcdsaCert();
+        // 產生 RSA 自簽憑證 (供 TLS 握手 + CredSSP TSCredentials 解密使用)
+        _tlsCert = CryptoHelper.CreateRsaCertForTls();
+        _tlsRsaKey = _tlsCert.GetRSAPrivateKey()!;
         _serverRandom = CryptoHelper.GenerateRandom(32);
     }
 
@@ -190,15 +192,17 @@ sealed class HoneypotServer
                     }
                 }
 
-                // CredSSP runs inside TLS before the MCS Connect Initial. We only
-                // record the NTLM username/domain and do not store passwords or hashes.
+// CredSSP runs inside TLS before the MCS Connect Initial.
                 if (useNla && state.Phase != SessionPhase.Error)
                 {
-                    var account = await HandleNlaAccountProbeAsync(stream, ct, textLog);
-                    if (account != null)
+                    var creds = await HandleNlaCredentialsAsync(stream, ct, textLog);
+                    if (creds != null)
                     {
-                        await SaveNlaAccountAsync(id, ep, localPort, account.Value.domain, account.Value.username, ct);
-                        await LogText(textLog, $"  >>> NLA account: {account.Value.domain}\\{account.Value.username}");
+                        await SaveNlaCredentialAsync(id, ep, localPort, creds.Value.domain, creds.Value.username, creds.Value.password, ct);
+                        var msg = creds.Value.password != null
+                            ? $"  >>> NLA credential: {creds.Value.domain}\\{creds.Value.username}:{creds.Value.password}"
+                            : $"  >>> NLA account: {creds.Value.domain}\\{creds.Value.username}";
+                        await LogText(textLog, msg);
                     }
 
                     state.Phase = SessionPhase.Done;
@@ -217,7 +221,7 @@ sealed class HoneypotServer
 
                     await LogText(textLog, $"  ([{state.Phase}] RX {tpkt.Length} bytes)");
 
-                    var response = ProcessPacket(state, tpkt);
+                    var response = await ProcessPacketAsync(state, tpkt);
 
                     if (response != null)
                     {
@@ -252,11 +256,11 @@ sealed class HoneypotServer
         Console.WriteLine($"[{id}] - Connection closed");
     }
 
-    /// <summary>
-    /// NLA 的最小探測器：送出 NTLM challenge，從 Type 3 Authenticate message
-    /// 讀取 domain/username。刻意不保存密碼、NTLM response 或 hash。
+/// <summary>
+    /// NLA 完整流程：NTLM Type 1/2/3 → SPNEGO accept → TSCredentials 解密
+    /// 記錄 domain/username/password（不保存 NTLM hash）
     /// </summary>
-    async Task<(string domain, string username)?> HandleNlaAccountProbeAsync(
+    async Task<(string domain, string username, string? password)?> HandleNlaCredentialsAsync(
         Stream stream, CancellationToken ct, StreamWriter textLog)
     {
         for (var attempt = 0; attempt < 4 && !ct.IsCancellationRequested; attempt++)
@@ -287,17 +291,248 @@ sealed class HoneypotServer
             {
                 var domain = ReadNtlmUnicodeField(request, ntlmOffset, 28) ?? "";
                 var username = ReadNtlmUnicodeField(request, ntlmOffset, 36) ?? "";
-                if (!string.IsNullOrWhiteSpace(username))
-                    return (domain, username);
+                if (string.IsNullOrWhiteSpace(username))
+                    return null;
+
+                // 寄出 SPNEGO accept-completed 讓 client 送出 TSCredentials
+                var accept = BuildSpnegoAcceptResponse();
+                await stream.WriteAsync(accept, ct);
+                await LogText(textLog, $"  (SPNEGO accept-completed sent: {accept.Length} bytes)");
+
+                // 讀取 TSCredentials TSRequest
+                var tsCreds = await ReadDerMessageAsync(stream, ct);
+                if (tsCreds == null)
+                {
+                    await LogText(textLog, $"  (no TSCredentials received)");
+                    return (domain, username, null);
+                }
+
+                // 從 TSRequest 中提取 authInfo 內容
+                var authInfo = ExtractAuthInfo(tsCreds);
+                if (authInfo == null || authInfo.Length < 256)
+                {
+                    await LogText(textLog, $"  (authInfo too short: {authInfo?.Length ?? 0} bytes)");
+                    return (domain, username, null);
+                }
+
+                // 解密 TSCredentials
+                var password = DecryptTSCredentials(authInfo, _tlsRsaKey);
+                if (password != null)
+                {
+                    await LogText(textLog, $"  >>> TSCredentials password: {password}");
+                }
+                else
+                {
+                    await LogText(textLog, $"  (TSCredentials decryption failed, saving raw)");
+                    var raw = Path.Combine(_logDir, $"session_{_sessionCounter:D6}", "authInfo_raw.bin");
+                    await File.WriteAllBytesAsync(raw, authInfo, ct);
+                }
+
+                return (domain, username, password);
             }
         }
 
         return null;
     }
 
-    /// <summary>儲存 NLA 帳號嘗試；不保存密碼、NTLM response 或 hash。</summary>
-    async Task SaveNlaAccountAsync(
-        long id, IPEndPoint ep, int localPort, string domain, string username, CancellationToken ct)
+    /// <summary>從 TSRequest DER 中提取 [2] authInfo OCTET STRING 的內容</summary>
+    static byte[]? ExtractAuthInfo(byte[] tsRequest)
+    {
+        // 簡單搜尋：找 0xA2 (context-specific tag 2, constructed) 後跟長度，再跟 0x04 (OCTET STRING)
+        for (var i = 0; i < tsRequest.Length - 2; i++)
+        {
+            if (tsRequest[i] == 0xA2)
+            {
+                // 解析長度
+                int lenStart = i + 1;
+                int contentLen;
+                int dataStart;
+                if ((tsRequest[lenStart] & 0x80) == 0)
+                {
+                    contentLen = tsRequest[lenStart];
+                    dataStart = lenStart + 1;
+                }
+                else
+                {
+                    var numBytes = tsRequest[lenStart] & 0x7F;
+                    if (numBytes == 0 || numBytes > 2) continue;
+                    contentLen = 0;
+                    for (var j = 0; j < numBytes; j++)
+                        contentLen = (contentLen << 8) | tsRequest[lenStart + 1 + j];
+                    dataStart = lenStart + 1 + numBytes;
+                }
+
+                // 內部應有 0x04 (OCTET STRING)
+                if (dataStart < tsRequest.Length && tsRequest[dataStart] == 0x04)
+                {
+                    int octetLenStart = dataStart + 1;
+                    int octetLen;
+                    int octetData;
+                    if ((tsRequest[octetLenStart] & 0x80) == 0)
+                    {
+                        octetLen = tsRequest[octetLenStart];
+                        octetData = octetLenStart + 1;
+                    }
+                    else
+                    {
+                        var numBytes = tsRequest[octetLenStart] & 0x7F;
+                        if (numBytes == 0 || numBytes > 2) continue;
+                        octetLen = 0;
+                        for (var j = 0; j < numBytes; j++)
+                            octetLen = (octetLen << 8) | tsRequest[octetLenStart + 1 + j];
+                        octetData = octetLenStart + 1 + numBytes;
+                    }
+
+                    if (octetData + octetLen <= tsRequest.Length)
+                        return tsRequest[octetData..(octetData + octetLen)];
+                }
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// 解密 TSCredentials：
+    /// authInfo = OAEP-SHA256-RSA 加密的 TSCredentialsKey (256 bytes) || AES-128-CBC 加密的 TSCredentials
+    /// AES key = SHA-256(TSCredentialsKey || "CredSSP1")[0..15]
+    /// AES IV  = SHA-256(TSCredentialsKey || "CredSSP1")[16..31]
+    /// </summary>
+    static string? DecryptTSCredentials(byte[] authInfo, RSA rsaKey)
+    {
+        try
+        {
+            // 前 256 bytes = 加密的 TSCredentialsKey (RSA-2048)
+            var encryptedKey = authInfo[..256];
+            var encryptedData = authInfo[256..];
+
+            // RSA-OAEP-SHA256 解密
+            var tsCredsKey = rsaKey.Decrypt(encryptedKey, RSAEncryptionPadding.OaepSHA256);
+
+            // 衍生 AES key + IV
+            var label = "CredSSP1"u8.ToArray();
+            var material = new byte[tsCredsKey.Length + label.Length];
+            Array.Copy(tsCredsKey, material, tsCredsKey.Length);
+            Array.Copy(label, 0, material, tsCredsKey.Length, label.Length);
+            var hash = SHA256.HashData(material);
+
+            var aesKey = hash[..16];
+            var aesIv = hash[16..32];
+
+            // AES-128-CBC 解密
+            using var aes = Aes.Create();
+            aes.Key = aesKey;
+            aes.IV = aesIv;
+            aes.Mode = CipherMode.CBC;
+            aes.Padding = PaddingMode.PKCS7;
+
+            using var decryptor = aes.CreateDecryptor();
+            var decrypted = decryptor.TransformFinalBlock(encryptedData, 0, encryptedData.Length);
+
+            // 解析 TSPasswordCreds
+            return ParseTSPasswordCreds(decrypted);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  [!] TSCredentials decryption failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 解析 TSCredentials ASN.1 → TSPasswordCreds
+    /// TSCredentials ::= SEQUENCE {
+    ///   credType    [0] INTEGER,
+    ///   credentials [1] OCTET STRING  -- TSPasswordCreds
+    /// }
+    /// TSPasswordCreds ::= SEQUENCE {
+    ///   domainName  [0] OCTET STRING,
+    ///   userName    [1] OCTET STRING,
+    ///   password    [2] OCTET STRING
+    /// }
+    /// </summary>
+    static string? ParseTSPasswordCreds(byte[] der)
+    {
+        // 非常簡易的 ASN.1 解析：找到 [2] OCTET STRING 的內容
+        // 依序搜尋 0xA0, 0xA1, 0xA2 context tags
+        var password = FindContextOctetString(der, 0x02);
+        return password != null ? Encoding.Unicode.GetString(password).TrimEnd('\0') : null;
+    }
+
+    /// <summary>在 DER 中搜尋 context tag [n] 內的 OCTET STRING 內容</summary>
+    static byte[]? FindContextOctetString(byte[] data, int contextTag)
+    {
+        var tag = (byte)(0xA0 | contextTag);
+        for (var i = 0; i < data.Length - 2; i++)
+        {
+            if (data[i] == tag)
+            {
+                int lenStart = i + 1;
+                int len;
+                int contentStart;
+                if ((data[lenStart] & 0x80) == 0)
+                {
+                    len = data[lenStart];
+                    contentStart = lenStart + 1;
+                }
+                else
+                {
+                    var numBytes = data[lenStart] & 0x7F;
+                    if (numBytes == 0 || numBytes > 2) continue;
+                    len = 0;
+                    for (var j = 0; j < numBytes; j++)
+                        len = (len << 8) | data[lenStart + 1 + j];
+                    contentStart = lenStart + 1 + numBytes;
+                }
+
+                // 內容應為 0x04 (OCTET STRING) 或直接是內容
+                if (contentStart < data.Length && data[contentStart] == 0x04)
+                {
+                    int olStart = contentStart + 1;
+                    int ol;
+                    int od;
+                    if ((data[olStart] & 0x80) == 0)
+                    {
+                        ol = data[olStart];
+                        od = olStart + 1;
+                    }
+                    else
+                    {
+                        var nb = data[olStart] & 0x7F;
+                        if (nb == 0 || nb > 2) continue;
+                        ol = 0;
+                        for (var j = 0; j < nb; j++)
+                            ol = (ol << 8) | data[olStart + 1 + j];
+                        od = olStart + 1 + nb;
+                    }
+                    if (od + ol <= data.Length)
+                        return data[od..(od + ol)];
+                }
+            }
+        }
+        return null;
+    }
+
+    /// <summary>建構 SPNEGO accept-completed 包在 TSRequest 中</summary>
+    static byte[] BuildSpnegoAcceptResponse()
+    {
+        // SPNEGO NegTokenResp: SEQUENCE { [0] ENUMERATED 0 (accept-completed) }
+        // Without mechListMIC (may work on some clients)
+        var negResult = Der(0xA0, [0x0A, 0x01, 0x00]); // [0] ENUMERATED 0
+        var spnego = Der(0x30, negResult); // NegTokenResp
+
+        // 包在 TSRequest 的 negoTokens 中
+        var octet = Der(0x04, spnego);
+        var token = Der(0xA0, octet);
+        var item = Der(0x30, token);
+        var tokenList = Der(0x30, item);
+        var negoTokens = Der(0xA1, tokenList);
+        var version = Der(0xA0, [0x02, 0x01, 0x05]);
+        return Der(0x30, [.. version, .. negoTokens]);
+    }
+
+    /// <summary>儲存 NLA 帳號 + 密碼</summary>
+    async Task SaveNlaCredentialAsync(
+        long id, IPEndPoint ep, int localPort, string domain, string username, string? password, CancellationToken ct)
     {
         var entry = new
         {
@@ -307,13 +542,25 @@ sealed class HoneypotServer
             source_port = ep.Port,
             target_port = localPort,
             domain,
-            username
+            username,
+            password
         };
 
         var json = JsonSerializer.Serialize(entry, new JsonSerializerOptions { WriteIndented = true });
         await File.AppendAllTextAsync(Path.Combine(_logDir, "nla_accounts.jsonl"), json + "\n", ct);
         await File.WriteAllTextAsync(
-            Path.Combine(_logDir, $"session_{id:D6}", "nla_account.json"), json, ct);
+            Path.Combine(_logDir, $"session_{id:D6}", "nla_credential.json"), json, ct);
+
+        if (!string.IsNullOrEmpty(password))
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"  ═══ NLA CREDENTIAL CAPTURED ═══");
+            Console.WriteLine($"  IP: {ep.Address}:{ep.Port} -> port {localPort}");
+            Console.WriteLine($"  User: {username}");
+            Console.WriteLine($"  Pass: {password}");
+            Console.WriteLine($"  Domain: {domain}");
+            Console.ResetColor();
+        }
     }
 
     static async Task<byte[]?> ReadDerMessageAsync(Stream stream, CancellationToken ct)
@@ -490,22 +737,101 @@ sealed class HoneypotServer
     }
 
     /// <summary>根據目前階段處理封包並產生回應</summary>
-    byte[]? ProcessPacket(RdpSessionState state, byte[] packet)
+    Task<byte[]?> ProcessPacketAsync(RdpSessionState state, byte[] packet)
     {
-        switch (state.Phase)
+        return state.Phase switch
         {
-            case SessionPhase.WaitMCS:
-                return HandleMCSConnectInitial(state, packet);
+            SessionPhase.WaitMCS => Task.FromResult(HandleMCSConnectInitial(state, packet)),
+            SessionPhase.WaitErectDomain => Task.FromResult(HandleErectDomainRequest(state, packet)),
+            SessionPhase.WaitAttachUser => Task.FromResult(HandleAttachUserRequest(state, packet)),
+            SessionPhase.WaitChannelJoin => Task.FromResult(HandleChannelJoinRequest(state, packet)),
+            SessionPhase.WaitSecurityExchange => HandleSecurityExchange(state, packet),
+            SessionPhase.WaitInfo => Task.FromResult(HandleInfoPDU(state, packet)),
+            _ => Task.FromResult<byte[]?>(null)
+        };
+    }
 
-            case SessionPhase.WaitSecurityExchange:
-                return HandleSecurityExchange(state, packet);
-
-            case SessionPhase.WaitInfo:
-                return HandleInfoPDU(state, packet);
-
-            default:
-                return null;
+    /// <summary>MCS Erect Domain Request → 不回應，直接進下一個階段</summary>
+    byte[]? HandleErectDomainRequest(RdpSessionState state, byte[] packet)
+    {
+        // 確認是 Erect Domain Request (0x04)
+        if (packet.Length < 8 || packet[7] != 0x04)
+        {
+            // 不是 Erect Domain Request，可能 client 直接跳過了
+            // 把這個封包當作 Attach User Request 重新處理
+            state.Phase = SessionPhase.WaitAttachUser;
+            return HandleAttachUserRequest(state, packet);
         }
+
+        // Erect Domain Request 不需要回應，直接進 Attach User 階段
+        state.Phase = SessionPhase.WaitAttachUser;
+        return null; // 不回傳任何東西
+    }
+
+    /// <summary>MCS Attach User Request → Attach User Confirm</summary>
+    byte[]? HandleAttachUserRequest(RdpSessionState state, byte[] packet)
+    {
+        // 確認是 Attach User Request (0x28)
+        if (packet.Length < 8 || packet[7] != 0x28)
+        {
+            state.Phase = SessionPhase.Error;
+            return null;
+        }
+
+        // 建構 Attach User Confirm:
+        // TPKT(4) + X.224(3) + MCS header(0x2E) + result(1) + user_id(2)
+        var confirm = new byte[] {
+            0x03, 0x00, 0x00, 0x0B, // TPKT length 11
+            0x02, 0xF0, 0x80,       // X.224 Data
+            0x2E,                   // MCS AttachUserConfirm, options=2 (end)
+            0x00,                   // result = 0 (success)
+            0x00, 0x01              // user_id = 1002 - 1001 (MCS_BASE_CHANNEL_ID)
+        };
+
+        state.Phase = SessionPhase.WaitChannelJoin;
+        return confirm;
+    }
+
+    /// <summary>MCS Channel Join Request → Channel Join Confirm</summary>
+    byte[]? HandleChannelJoinRequest(RdpSessionState state, byte[] packet)
+    {
+        // 確認是 Channel Join Request (0x38)
+        if (packet.Length < 8 || packet[7] != 0x38)
+        {
+            state.Phase = SessionPhase.Error;
+            return null;
+        }
+
+        // 解析 channel_id (從 PER 編碼中)
+        // 格式: 0x38 + initiator(2 bytes) + channel_id(2 bytes)
+        if (packet.Length < 12)
+        {
+            state.Phase = SessionPhase.Error;
+            return null;
+        }
+
+        var requestedChannel = (ushort)((packet[10] << 8) | packet[11]);
+        state.ChannelId = requestedChannel;
+
+        // 建構 Channel Join Confirm:
+        // TPKT(4) + X.224(3) + MCS header(0x3E) + result(1) + initiator(2) + requested(2) + channelId(2)
+        var confirm = new byte[] {
+            0x03, 0x00, 0x00, 0x0F, // TPKT length 15
+            0x02, 0xF0, 0x80,       // X.224 Data
+            0x3E,                   // MCS ChannelJoinConfirm, options=2 (end)
+            0x00,                   // result = 0 (success)
+            0x00, 0x01,             // initiator = 1002 - 1001
+            (byte)(requestedChannel >> 8), (byte)requestedChannel, // requested channel
+            (byte)(requestedChannel >> 8), (byte)requestedChannel  // assigned channel (same)
+        };
+
+        // 注意：如果 client 有多個 channel 要 join，我們需要繼續等待
+        // 如果 join 的是 global channel (1003)，則進入 Security Exchange 階段
+        state.Phase = (requestedChannel == 1003)
+            ? SessionPhase.WaitSecurityExchange
+            : SessionPhase.WaitChannelJoin; // 繼續等待其他 channel join
+
+        return confirm;
     }
 
     /// <summary>MCS Connect Initial → 回傳 Connect Response (含 Server 憑證)</summary>
@@ -531,37 +857,51 @@ sealed class HoneypotServer
         Console.WriteLine($"  [DBG] MCS Connect Response built: {response.Length} bytes");
         Console.WriteLine($"  [DBG] Response first 120: {Convert.ToHexString(response[..Math.Min(120, response.Length)])}");
 
-        state.Phase = SessionPhase.WaitSecurityExchange;
+        state.Phase = SessionPhase.WaitErectDomain;
         return response;
     }
 
     /// <summary>Security Exchange PDU → 解密 client random，推算 RC4 金鑰</summary>
-    byte[]? HandleSecurityExchange(RdpSessionState state, byte[] packet)
+    async Task<byte[]?> HandleSecurityExchange(RdpSessionState state, byte[] packet)
     {
         try
         {
-            // Security Exchange PDU 結構: TPKT + X.224 Data(0xF0) + MCS Send Data Indication + Security Exchange PDU
-            // 實際的 client random 加密資料在 payload 中
-            var payload = RdpPacket.ExtractPayload(packet);
+            // 實際封包結構 (client → server):
+            // TPKT + X.224 Data + MCS Send Data Request (0x64) + RDP security header + payload
+            // TLS 模式下 client 可能直接送 Info PDU (SEC_INFO_PKT)，沒有 Security Exchange
+            var payload = RdpPacket.ExtractPayloadForTls(packet);
             if (payload == null || payload.Length == 0)
             {
-                state.Phase = SessionPhase.Error;
-                return null;
+                // 沒有 payload → 當作標準 Security Exchange (空) 處理
             }
-
-            // 解密 client random (RSA 2048)
-            var clientRandom = CryptoHelper.DecryptClientRandom(payload, _rsaKey);
-
-            if (clientRandom != null && clientRandom.Length == 32)
+            else
             {
-                state.ClientRandom = clientRandom;
+                // 檢查 RDP security flags
+                var flags = ExtractSecurityFlags(packet);
+                bool isInfoPdu = (flags & 0x0040) != 0; // SEC_INFO_PKT
 
-                // 衍生 RC4 session keys
-                var (decryptKey, encryptKey) = CryptoHelper.DeriveSessionKeys(
-                    clientRandom, _serverRandom);
+                if (isInfoPdu)
+                {
+                    // 這是 Info PDU，不是 Security Exchange！
+                    await LogInfoPduAsync(packet, state, payload);
+                    state.Phase = SessionPhase.Done;
+                    return RdpPacket.BuildDataAck();
+                }
 
-                state.DecryptKey = decryptKey;
-                state.EncryptKey = encryptKey;
+                // 標準 Security Exchange: 解密 client random (RSA 2048)
+                var clientRandom = CryptoHelper.DecryptClientRandom(payload, _rsaKey);
+
+                if (clientRandom != null && clientRandom.Length == 32)
+                {
+                    state.ClientRandom = clientRandom;
+
+                    // 衍生 RC4 session keys
+                    var (decryptKey, encryptKey) = CryptoHelper.DeriveSessionKeys(
+                        clientRandom, _serverRandom);
+
+                    state.DecryptKey = decryptKey;
+                    state.EncryptKey = encryptKey;
+                }
             }
         }
         catch (Exception ex)
@@ -577,12 +917,58 @@ sealed class HoneypotServer
         return ack;
     }
 
+    /// <summary>從封包中提取 RDP security header 的 flags (16-bit little-endian)</summary>
+    static ushort ExtractSecurityFlags(byte[] packet)
+    {
+        // 找 MCS choice byte (0x64 = Send Data Request) 之後的 dataPriority + segmentation
+        for (var i = 6; i < packet.Length - 6; i++)
+        {
+            if (packet[i] == 0x64 && packet[i + 1] != 0xFF)
+            {
+                // MCS: choice(1) + initiator(2) + channel(2) + priority(1) + segmentation(1)
+                int p = i + 1 + 2 + 2 + 1 + 1;
+                if (p + 4 <= packet.Length)
+                {
+                    return (ushort)(packet[p] | (packet[p + 1] << 8));
+                }
+            }
+        }
+        return 0;
+    }
+
+    /// <summary>直接處理 Info PDU payload 並紀錄帳密</summary>
+    async Task LogInfoPduAsync(byte[] packet, RdpSessionState state, byte[] payload)
+    {
+        try
+        {
+            var cred = RdpPacket.ParseInfoPDU(payload);
+            if (cred != null)
+            {
+                state.Credential = cred with { ClientInfo = state.ClientInfo };
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"  ═══ CREDENTIAL CAPTURED ═══");
+                Console.WriteLine($"  User: {cred.Username}");
+                Console.WriteLine($"  Pass: {cred.Password}");
+                Console.WriteLine($"  Domain: {cred.Domain}");
+                Console.ResetColor();
+            }
+            else
+            {
+                Console.WriteLine($"  [!] Info PDU parse failed (payload={payload.Length} bytes)");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  [!] Info PDU parse error: {ex.Message}");
+        }
+    }
+
     /// <summary>Info PDU → 解密並提取帳號密碼 (支援 TLS 明文與 RC4 兩種)</summary>
     byte[]? HandleInfoPDU(RdpSessionState state, byte[] packet)
     {
         try
         {
-            var payload = RdpPacket.ExtractPayload(packet);
+            var payload = RdpPacket.ExtractPayloadForTls(packet);
             if (payload == null || payload.Length == 0)
             {
                 Console.WriteLine("  [!] Info PDU: 無法提取 payload");
@@ -663,6 +1049,9 @@ enum SessionPhase
 {
     WaitX224,
     WaitMCS,
+    WaitErectDomain,
+    WaitAttachUser,
+    WaitChannelJoin,
     WaitSecurityExchange,
     WaitInfo,
     Done,
@@ -679,6 +1068,8 @@ class RdpSessionState
     public byte[]? EncryptKey { get; set; }
     public bool UseTls { get; set; }
     public bool UseNla { get; set; }
+    public ushort UserId { get; set; }
+    public ushort ChannelId { get; set; }
     public CapturedCredential? Credential { get; set; }
 }
 

@@ -1,21 +1,25 @@
 # RDP Honeypot（防禦型 RDP 蜜罐）
 
-以 C# 撰寫的防禦型 RDP 蜜罐（Honeypot）。部署在您擁有或授權的網路上，用於**偵測、記錄試圖連線到您的伺服器的掃描器與攻擊者**，並擷取他們嘗試使用的帳號密碼。
+以 C# (.NET 10) 撰寫的防禦型 RDP 蜜罐，部署在您擁有或授權的網路上，用於**偵測、記錄試圖連線到您的伺服器的掃描器與攻擊者**，並擷取他們嘗試使用的帳號密碼，藉以分辨漏洞利用與字典攻擊。
 
 > **⚠ 重要聲明**：本工具僅供**防禦用途**，僅限部署在您擁有或明確授權的網路環境中。未經授權攔截他人登入憑證，在台灣可能觸犯《刑法》第 358–363 條（妨害電腦使用罪）及《個人資料保護法》，在其他司法管轄區亦有相應罰則。請勿將本工具用於欺騙或竊取真實使用者的憑證。
+>
+> 憑證資料（含密碼）為高度敏感資料，儲存時請確保：檔案存取權限設為最小化、硬碟加密、定期清除、勿上傳至公共環境。
 
 ---
 
 ## 功能特色
 
-- **多連接埠監聽**：可同時監聽多個連接埠（例如 `4499, 4500, 4501`），模擬多個服務吸引攻擊者
-- **JSON 設定檔**：啟動時從 `config.json` 讀取監聽連接埠與記錄目錄，亦可使用命令列覆寫
-- **雙安全模式支援**：
-  - **標準 RDP 安全**（無 NLA）：RSA 金鑰交換 + RC4 加密 → 可解密擷取明文帳號密碼
-  - **SSL/TLS 安全**（`RDP_NEG_RSP` 回覆 `0x01`）：TLS 1.2 通道 → 憑證握手後直接讀取明文憑證
+- **多連接埠監聽**：同時監聽多個連接埠（例如 `4499, 4500, 4501`），模擬多個目標吸引攻擊者
+- **JSON 設定檔**：從 `config.json` 讀取設定，亦可使用命令列覆寫
+- **三種安全模式支援**：
+  - **標準 RDP 安全**（無 TLS/NLA）：RSA 金鑰交換 + RC4 加密 → 解密擷取帳號密碼
+  - **SSL/TLS 安全**：TLS 1.2（RSA 憑證 + ECDHE）→ TLS 通道內直接讀取 Info PDU
+  - **NLA/CredSSP（部分）**：處理 NTLM Type 1/2/3，擷取 **帳號與網域**（密碼需 TSCredentials，現代 mstsc 因 SPNEGO mechListMIC 通常拒絕後續交換）
 - **完整擷取資訊**：來源 IP、來源連接埠、目標連接埠、帳號、密碼、網域、Cookie、時間戳
-- **檔案式記錄**：JSONL 匯總檔 + 每 session 獨立目錄（文字日誌 + 原始封包）
-- **安全防護機制**：拒絕監聽 `3389`（正常 Windows RDP）與所有低於 `1024` 的系統連接埠，確保絕不與正式服務衝突
+- **Console 即時顯示**：成功擷取憑證時以紅字顯示在終端機
+- **雙檔記錄**：JSONL 匯總檔 + 每 session 獨立目錄（文字日誌 + 原始封包）
+- **安全防護機制**：拒絕監聽 `3389`（正常 Windows RDP）、`3388` 與所有低於 `1024` 的系統連接埠，確保不與正式服務衝突
 - **零系統侵入**：不改寫 Windows 服務、防火牆規則或登錄檔
 
 ---
@@ -23,54 +27,59 @@
 ## 系統需求
 
 - .NET SDK 10 或更新版本（執行時期可為自包含發布）
-- Windows 10/11 或 Windows Server 2019+（TLS 功能依賴 Schannel）
-- 執行需要系統管理員權限（僅當要監聽需要權限的連接埠時；預設連接埠通常不需要）
+- Windows 10/11 或 Windows Server 2019+（TLS 依賴 Schannel）
+- 執行通常不需系統管理員權限（除非要監聽需要權限的連接埠）
 
 ---
 
-## 編譯
+## 快速開始
+
+### 1. 編譯
 
 ```bash
 cd RdpHoneypot
 dotnet build -c Release
 ```
 
-編譯產物位於 `bin/Release/net10.0/RdpHoneypot.exe`。
+編譯產物位於 `bin\Release\net10.0\RdpHoneypot.exe`。
+
+### 2. 執行
+
+```bash
+bin\Release\net10.0\RdpHoneypot.exe --port 4499,4500,4501
+```
+
+Log 預設寫在 **exe 同層目錄**（`bin\Release\net10.0\`），感謝您並未指定 `--output`。
+
+### 3. 測試連線
+
+```text
+mstsc /v:<伺服器IP>:4499
+```
+
+輸入帳號密碼後，蜜罐會在 console 以紅字顯示擷取到的帳密。
 
 ---
 
-## 使用方式
-
-### 直接執行（使用預設 `config.json`）
-
-```bash
-RdpHoneypot.exe
-```
-
-程式會在**目前工作目錄**尋找 `config.json`。若找不到則使用預設值（`4499`、`logs`）。
-
-### 指定設定檔
-
-```bash
-RdpHoneypot.exe --config my-config.json
-```
-
-### 命令列覆寫
-
-命令列參數優先於設定檔：
-
-```bash
-RdpHoneypot.exe --port 4499,4500,4501 --output logs
-```
-
-### 完整參數
+## 命令列參數
 
 | 參數 | 說明 |
 |------|------|
 | `--config <path>` | 設定檔路徑（預設 `./config.json`） |
 | `--port <p1,p2,...>` | 覆寫監聽連接埠（逗號分隔） |
-| `--output <dir>` | 覆寫記錄目錄 |
+| `--output <dir>` | 覆寫記錄目錄（預設 = exe 所在目錄） |
 | `--help` / `-h` | 顯示說明 |
+
+```bash
+# 使用設定檔（預設行為）
+RdpHoneypot.exe
+
+# 指定設定檔
+RdpHoneypot.exe --config my-config.json
+
+# 命令列覆寫（優先於設定檔）
+RdpHoneypot.exe --port 4499,4500,4501 --output D:\honeypot-logs
+```
 
 ---
 
@@ -80,47 +89,76 @@ RdpHoneypot.exe --port 4499,4500,4501 --output logs
 
 ```json
 {
-  "ports": [4499, 4500, 4501],
-  "logDir": "logs"
+  "ports": [4499, 4500, 4501]
 }
 ```
 
 | 欄位 | 型別 | 說明 |
 |------|------|------|
 | `ports` | 整數陣列 | 要監聽的連接埠清單。禁止使用 3389、3388 及 <1024 的連接埠 |
-| `logDir` | 字串 | 記錄輸出目錄。支援相對路徑（相對於目前工作目錄）或絕對路徑 |
+| `logDir` | 字串 | 記錄輸出目錄（省略時 = exe 所在目錄） |
 
-> **注意**：JSON 中 Windows 絕對路徑的反斜線必須跳脫（`C:\\logs`）或改用正斜線（`C:/logs`）。
+> **注意**：JSON 中 Windows 絕對路徑的反斜線必須跳脫（`"D:\\logs"`）或改用正斜線（`"D:/logs"`）。
 
 ---
 
 ## 記錄檔結構
 
 ```
-logs/
-├── honeypot.log              # 啟動/停止紀錄
-├── captured_creds.jsonl      # 所有擷取憑證（JSONL，每行一筆）
+<logDir>  (預設 = exe 所在目錄)
+├── honeypot.log                  # 啟動/停止紀錄
+├── captured_creds.jsonl          # 所有成功擷取的憑證（JSONL，每行一筆）
+├── nla_accounts.jsonl            # NLA 路徑擷取的帳號（含網域與 IP）
 └── session_000001/
-    ├── session.log           # 該連線的協定階段文字紀錄
-    ├── raw.bin               # 原始封包資料（除錯用）
-    └── credential.json       # 該次擷取的憑證（若成功）
+    ├── session.log               # 該連線的協定階段文字紀錄
+    ├── raw.bin                   # 原始封包資料（除錯用）
+    ├── credential.json           # 標準/TLS 路徑擷取的憑證（若成功）
+    └── nla_credential.json       # NLA 路徑擷取的帳號/密碼（若成功）
 ```
 
-`captured_creds.jsonl` 範例：
+### captured_creds.jsonl 範例（標準 / TLS 安全模式）
 
 ```json
 {
-  "session_id": 2,
-  "timestamp": "2026-08-13T08:14:31.9916297Z",
-  "source_ip": "127.0.0.1",
-  "source_port": 50984,
+  "session_id": 3,
+  "timestamp": "2026-08-17T05:02:12.6674375Z",
+  "source_ip": "192.168.121.153",
+  "source_port": 6263,
   "target_port": 4499,
-  "username": "tlsadmin",
-  "password": "TlsP@ss456",
-  "domain": "CORP",
-  "client_info": "cookie='Cookie: mstshash=test'"
+  "username": "no2somdej@hotmail.com",
+  "password": "123456",
+  "domain": "",
+  "client_info": "cookie='Cookie: mstshash=no2somdej'"
 }
 ```
+
+### nla_accounts.jsonl 範例（NLA / CredSSP 安全模式）
+
+```json
+{
+  "session_id": 1,
+  "timestamp": "2026-08-17T03:35:16.2561128Z",
+  "source_ip": "192.168.121.153",
+  "source_port": 13526,
+  "target_port": 4499,
+  "domain": "",
+  "username": "no2somdej@hotmail.com"
+}
+```
+
+---
+
+## 如何使用擷取結果判斷攻擊類型
+
+| 觀察到的模式 | 推斷 |
+|--------------|------|
+| 同一 IP、同一帳號、多組不同密碼 | **字典攻擊**（密碼噴灑） |
+| 同一 IP、多組不同帳號 | **帳號清單掃描** |
+| 大量不同 IP、偶發常見帳號（`admin`/`administrator`） | **網際網路掃描 / 蠕蟲** |
+| NLA 路徑重複收到 NTLM Type 3 | **有人掌握有效網域帳號** |
+| 成功登入後的動作 | 需搭配 Windows Event Log 4624/4625 綜合判斷 |
+
+> 建議搭配 **Windows 事件檢視器**：`Microsoft-Windows-TerminalServices-LocalSessionManager/Operational` 中的 4624（登入成功）與 4625（登入失敗）事件，可確認真正的「成功入侵」與「嘗試失敗」。
 
 ---
 
@@ -133,65 +171,80 @@ logs/
                                   │
                                   ├─ 多連接埠並行監聽 (TcpListener x N)
                                   │
-                                  └─ 每個連線: RdpSession
-                                       ├─ X.224 協商
-                                       ├─ (選擇性) TLS 1.2 握手
+                                  └─ 每個連線: HandleSessionAsync
+                                       ├─ X.224 協商（RDP_NEG_REQ / RSP）
+                                       ├─ (選擇性) TLS 1.2 握手（RSA 憑證 + ECDHE）
+                                       ├─ (選擇性) NLA/CredSSP：NTLM Type 1/2/3
                                        ├─ MCS Connect 交換
-                                       ├─ Security Exchange (RSA)
-                                       └─ Info PDU → 憑證解析 → JSONL 記錄
+                                       ├─ MCS Erect Domain / Attach User / Channel Join
+                                       ├─ Security Exchange（標準安全模式解密 ClientRandom）
+                                       └─ Info PDU → 憑證解析 → Console + JSONL 記錄
 ```
 
-### RDP 協定流程（標準安全模式）
-
-```
-1. Client 送出 X.224 Connection Request
-2. Server 回覆 X.224 Connection Confirm
-3. Client 送出 MCS Connect Initial（BER 編碼）
-4. Server 回覆 MCS Connect Response
-   ├─ Server Core Data
-   └─ Server Security Data
-        ├─ encryptionMethod = 7 (40/56/128-bit RC4)
-        ├─ encryptionLevel = 2 (client-requested)
-        ├─ ServerRandom (32 bytes)
-        └─ Server Certificate (RSA 2048)
-5. Client 送出 Security Exchange PDU
-   └─ ClientRandom 以伺服器 RSA 公鑰加密 (PKCS#1 v1.5)
-6. Server 以 RSA 私鑰解密 ClientRandom
-7. 雙方以 MD5 衍生 RC4 Session Keys
-   ├─ SessionKeyBlob = MD5(ClientRandom + ServerRandom + ClientRandom)
-   ├─ DecryptKey = MD5(SessionKeyBlob + pad(0x5C))
-   └─ EncryptKey = MD5(SessionKeyBlob + pad(0x36))
-8. Client 送出 Info PDU（RC4 加密）
-   └─ 內含 Domain / UserName / Password (UTF-16)
-9. Server 以 RC4 解密並解析 → 擷取帳號密碼
-```
-
-### RDP 協定流程（SSL/TLS 模式）
+### RDP 協定流程（TLS 模式，最常用）
 
 ```
 1. Client 送出 X.224 CR + RDP_NEG_REQ (requestedProtocols 含 0x01)
-2. Server 回覆 X.224 CC + RDP_NEG_RSP (selectedProtocol = 0x01 SSL)
-3. TLS 1.2 握手（ECDSA 憑證，ECDHE 金鑰交換）
-4. 後續 MCS / Security Exchange / Info PDU 全部在 TLS 通道內
-5. Info PDU 以明文（TLS 已提供加密）→ 直接解析擷取
+2. Server 回覆 X.224 CC + RDP_NEG_RSP (selectedProtocol)
+3. TLS 1.2 握手（RSA 2048 憑證，ECDHE 金鑰交換）
+4. MCS Connect Initial → Server 回覆 Connect Response
+5. MCS Erect Domain Request（無回應）
+6. MCS Attach User Request → Server 回覆 Attach User Confirm
+7. MCS Channel Join Request（IO channel 1003）→ Server 回覆 Channel Join Confirm
+8. Info PDU（TLS 通道明文）→ 解析 Domain / UserName / Password (UTF-16)
+   └─ 若 client 跳過 Security Exchange 直接送 Info PDU，Server 會自動偵測 SEC_INFO_PKT flag
+```
+
+### RDP 協定流程（標準安全模式，無 TLS）
+
+```
+1. X.224 CR/CC（不含 TLS）
+2. MCS Connect Initial → Response（內含 ServerRandom + RSA 2048 憑證）
+3. MCS Erect Domain / Attach User / Channel Join（同上）
+4. Security Exchange PDU：ClientRandom 以 RSA 公鑰加密
+5. Server 以 RSA 私鑰解密 ClientRandom → 衍生 RC4 Session Keys
+   ├─ SessionKeyBlob = MD5(ClientRandom + ServerRandom + ClientRandom)
+   └─ DecryptKey = MD5(SessionKeyBlob + pad(0x5C))
+6. Info PDU（RC4 加密）→ 先 RC4 解密再解析
+```
+
+### NLA / CredSSP 流程（部分支援）
+
+```
+1. X.224 CR 含 requestedProtocols 0x04 (HYBRID/NLA)
+2. Server 回覆 selectedProtocol = 0x02（CredSSP 通道）
+3. TLS 1.2 握手
+4. Client 送 TSRequest（內含 SPNEGO/NTLM Type 1）
+5. Server 回覆 TSRequest（內含 NTLM Type 2 Challenge）
+6. Client 送 TSRequest（內含 NTLM Type 3 → Username/Domain）
+7. Server 解析並記錄帳號/網域
+8. Server 嘗試送出 SPNEGO accept-completed，希望收到 TSCredentials（含密碼）
+   └─ 現代 mstsc 驗證 mechListMIC：因 Server 無密碼 hash 無法計算，
+       故通常在此中斷 → 僅能取得帳號/網域，無法取得明文密碼
 ```
 
 ### 雙憑證架構
 
 | 用途 | 演算法 | 說明 |
 |------|--------|------|
-| TLS 握手 | **ECDSA P-256** | 支援 ECDHE 金鑰交換（Windows Schannel 相容） |
+| TLS 握手 | **RSA 2048** | 支援 ECDHE 金鑰交換；其私鑰亦可用於 CredSSP TSCredentials 解密 |
 | RDP 安全交換 | **RSA 2048** | 加密/解密 ClientRandom（內嵌於 MCS Response） |
 
 ### 關鍵技術重點
 
-1. **Windows Schannel 相容性**：.NET 產生的記憶體金鑰無法直接被 Schannel 存取，導致 `platform does not support ephemeral keys` 錯誤。解法是將 ECDSA 自簽憑證匯出為 PFX 後，以 `X509KeyStorageFlags.PersistKeySet` 重新載入，註冊到 Windows 金鑰存放區。
+1. **Windows Schannel 相容性**：.NET 產生的記憶體金鑰無法直接被 Schannel 存取，導致 `platform does not support ephemeral keys` 錯誤。解法是將自簽憑證匯出為 PFX 後，以 `X509KeyStorageFlags.PersistKeySet` 重新載入，註冊到 Windows 金鑰存放區。
 
-2. **TPKT 長度正確性**：RDP 每個封包的 TPKT 長度欄位（bytes 2-3，Big-Endian）必須與實際封包長度完全一致，否則殘留位元組會造成後續封包讀取錯位。
+2. **RDP 協商位元**：`RDP_NEG_REQ.requestedProtocols` 的位元定義為 `0x01=Standard`、`0x02=TLS`、`0x04=NLA (HYBRID)`。選擇協定時依此正確對應，避免把 TLS 誤判為 NLA。
 
-3. **BER 編碼**：MCS Connect Response 的 BER 長度欄位使用 Big-Endian（`0x82 + 2 bytes`），與 GCC 資料內部使用的 Little-Endian 欄位不同，兩者不可混淆。
+3. **MCS 完整握手**：除 Connect Initial/Response 外，還需處理 **Erect Domain Request → Attach User Request → Channel Join Request** 等階段，client 才會送出含憑證的 Info PDU。
 
-4. **Info PDU 雙模式解析**：自動嘗試「明文解析」（TLS 通道已解密）與「RC4 解密後解析」（標準安全），兩種模式皆可擷取。
+4. **TPKT/X.224 偏移**：X.224 Data header 為 `02 F0 80`（LI + PDU type + EOT），從 `0xF0` 起只需再跳過 2 bytes，多跳 1 byte 會導致封包解析錯位。
+
+5. **Info PDU 解析**：payload 在 security header 後可能有 1-byte padding，且各字串（domain/username/password）間有空字元 terminator。解析器需嘗試 offset 0/1 並跳過欄位間 null bytes。
+
+6. **MCS Send Data Request (0x64) vs Send Data Indication (0x04)**：TLS 模式的 Info PDU 通常以 `0x64`（Send Data Request）傳送，需正確跳過其 header（choice + initiator + channel + priority + segmentation = 7 bytes）。
+
+7. **BER 編碼**：MCS Connect Response 的 BER 長度欄位使用 Big-Endian（`0x82 + 2 bytes`），與 GCC 資料內部使用的 Little-Endian 欄位不同，兩者不可混淆。
 
 ---
 
@@ -199,15 +252,16 @@ logs/
 
 ### 為什麼 mstsc 連線可能失敗？
 
-- 現代 Windows mstsc **預設啟用 NLA（CredSSP）**。當蜜罐回覆 `RDP_NEG_RSP` 為標準安全或 SSL（非 CredSSP）時，mstsc 可能拒絕連線或顯示錯誤。
-- 若需支援 NLA，需實作完整 CredSSP 協定（SPNEGO / NTLM / Kerberos），這是數千行程式碼的工程。pyRDP 的 MITM 模式透過轉發到真實伺服器繞過此問題。
+- 現代 Windows mstsc **預設啟用 NLA（CredSSP）**。蜜罐對 NLA 只做到 NTLM Type 3（取得帳號），無法完成 SPNEGO 的 mechListMIC 驗證，因此 mstsc 在 TSCredentials 階段會中斷。
+- 若 mstsc 在 NLA 失敗後自動 fallback 到 TLS/標準安全（視本機設定而定），蜜罐即可完整擷取帳號密碼。
 - 當 mstsc 顯示自簽憑證警告時，使用者需按「是」才能繼續。
 
 ### 部署建議
 
 - **僅部署在隔離/受控網路**（內部測試網段、DMZ 的蜜罐區）
-- 建議搭配防火牆規則，僅允許預期的來源連入蜜罐連接埠
-- 定期檢視 `captured_creds.jsonl`，比對是否有內部帳號被嘗試（可偵測密碼噴灑攻擊）
+- 搭配防火牆規則，僅允許預期的來源連入蜜罐連接埠
+- 定期檢視 `captured_creds.jsonl` 與 `nla_accounts.jsonl`，比對是否有內部帳號被嘗試（可偵測密碼噴灑）
+- 憑證檔案視為機密，限制檔案系統權限並定期輪替清除
 
 ### 法律與倫理
 
@@ -221,14 +275,15 @@ logs/
 
 | 限制 | 說明 |
 |------|------|
-| NLA (CredSSP) 不支援 | 現代 mstsc 預設 NLA 時無法連線；需 CredSSP 實作或 MITM 模式 |
+| NLA (CredSSP) 密碼未擷取 | 現代 mstsc 因 mechListMIC 拒絕 SPNEGO accept，無法取得 TSCredentials（明文密碼），僅取得帳號/網域 |
 | TLS 依賴 Schannel | 在非 Windows 平台（Linux/macOS）TLS 行為可能不同 |
 | 無真實桌面回應 | 蜜罐不提供完整 RDP 桌面會話，僅完成認證階段 |
 | 憑證為自簽 | 連線方會看到憑證警告 |
 
 **未來可能方向**：
-- 實作 CredSSP / NTLM 支援以相容 NLA
+- 完成 NLA/CredSSP：使用 `NegotiateAuthentication` 或自訂 NTLM Session Key 衍生產生有效 mechListMIC
 - MITM 模式（轉發到真實 RDP 伺服器，如 pyRDP）
+- 以 `netstat` / Windows ETW 補足來源 GeoIP / ASN 資訊
 - Web 管理介面檢視擷取結果
 - 匯出為 SIEM 格式（CEF / Syslog）
 
@@ -237,5 +292,7 @@ logs/
 ## 參考
 
 - [MS-RDPBCGR: Remote Desktop Protocol: Basic Connectivity and Graphics Remoting](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/)（RDP 協定規格）
+- [MS-NLMP: NT LAN Manager (NTLM) Authentication Protocol](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-nlmp/)（NTLM Type 1/2/3 結構）
+- [MS-CSSP: CredSSP Protocol](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-cssp/)（TSCredentials 加密）
 - [pyRDP](https://github.com/GoSecure/pyrdp)（Python RDP 蜜罐/MITM，本專案概念參考來源）
-- [fake-rdp](https://github.com/cheeseandcereal/fake-rdp)（簡易 RDP 偽裝伺服器）
+- [FreeRDP mcs.c](https://github.com/FreeRDP/FreeRDP/blob/master/libfreerdp/core/mcs.c)（T.125 MCS 訊息格式參考）

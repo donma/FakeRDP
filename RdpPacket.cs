@@ -382,45 +382,50 @@ static class RdpPacket
     }
 
     /// <summary>
-    /// 從 RDP 封包中提取實際 payload (跳過 TPKT + X.224 + MCS 外層)
+    /// 從 TLS 模式的 RDP 封包中提取真正的 payload，
+    /// 跳過 TPKT + X.224 + MCS Send Data Request/Indication + RDP security header。
+    /// 支援 0x64 (Send Data Request) 與 0x04 (Send Data Indication) 兩種 MCS 類型。
     /// </summary>
-    public static byte[]? ExtractPayload(byte[] packet)
+    public static byte[]? ExtractPayloadForTls(byte[] packet)
     {
         if (packet.Length < 15) return null;
 
-        // TPKT (4) + X.224 Data (3) + MCS Send Data Indication (8+) + payload
-        // 跳過 X.224 header: 找到第一個 0xF0 (X.224 Data)
+        // TPKT (4) + X.224 Data (3)
         int pos = 4;
         while (pos < packet.Length && packet[pos] != 0xF0)
             pos++;
-
         if (pos >= packet.Length - 1) return null;
+        pos += 2; // skip PDU type (0xF0) + EOT flag (1 byte each)
 
-        // 跳過 X.224 DT header (0xF0 + 2 bytes)
-        pos += 3;
+        if (pos >= packet.Length) return null;
 
-        // 跳過 MCS Send Data Indication (variable length, 至少 8 bytes)
-        if (pos + 3 > packet.Length) return null;
-
-// MCS Send Data Indication: 0x04 (perception priority) 0x00 (user id) 0x00 (channel id) ...
-            // 實際格式: 0x04 + 2 bytes user id + 2 bytes channel id + 2 bytes data priority + 1 byte segmentation
-            // 總共 8 bytes
-            // 檢查是否有分段標記
-        if (pos < packet.Length)
+        // MCS 類型判斷
+        byte mcsType = packet[pos];
+        if (mcsType == 0x64) // Send Data Request
         {
-            // 檢查 MCS 的 TPDU header (0x04)
-            // 快速跳過: 找 payload 起始
-            // 更簡單的方法: 從尾部往前找
-            // 對於標準 RDP 連線，payload 通常從 offset 15 附近開始
-            // 但更可靠是跳過已知的固定 header
-            // 試著從 offset 11 開始找第一個非 0x00 的連續資料
-            // 實際上 payload 起始位置 = 4 (TPKT) + 3 (X.224) + 8 (MCS) = 15
-            var payloadStart = 15;
-            if (payloadStart < packet.Length)
-                return packet[payloadStart..];
+            // choice(1) + initiator(2) + channel(2) + priority(1) + segmentation(1) = 7
+            if (pos + 7 > packet.Length) return null;
+            pos += 7;
+        }
+        else if (mcsType == 0x04) // Send Data Indication
+        {
+            // type(1) + initiator(2) + channel(2) + segmentation(1) = 6
+            // (priority is often combined with segmentation in 1 byte)
+            if (pos + 6 > packet.Length) return null;
+            pos += 6;
+        }
+        else
+        {
+            // 未知 MCS 類型，直接回傳剩下的資料
+            return packet[pos..];
         }
 
-        return null;
+        // 跳過 RDP security header (4 bytes: flags + flagsHi)
+        if (pos + 4 > packet.Length) return null;
+        pos += 4;
+
+        if (pos >= packet.Length) return null;
+        return packet[pos..];
     }
 
     /// <summary>
@@ -447,8 +452,7 @@ static class RdpPacket
         try
         {
             // Info PDU 結構 (TS_INFO_PACKET):
-            //   4 bytes: PDU header (type=0, flags=0) — 在 RDP 流量中必定存在
-            //   codePage (4 bytes) - 通常 0
+            //   codePage (4 bytes) - 通常 0 或系統 code page
             //   flags (4 bytes) - INFO flags
             //   cbDomain (2 bytes) - domain 長度 (bytes)
             //   cbUserName (2 bytes) - username 長度 (bytes)
@@ -460,60 +464,69 @@ static class RdpPacket
             //   Password (Unicode, cbPassword bytes)
             //   AlternateShell (Unicode)
             //   WorkingDir (Unicode)
+            //
+            // 注意：有些 client 會在 security header 後加 1-byte padding (0x00)，
+            // 所以 TS_INFO_PACKET 可能從 offset 0 或 offset 1 開始。
+            // 此外，在 cb 欄位與字串之間可能有額外的 padding byte。
 
-            // 跳過 4 bytes PDU header (type + flags)
-            int offset = 0;
+            if (data.Length < 20)
+                return null;
 
-            // 寬鬆偵測: 若前 4 bytes 全為 0x00 (可能是 codePage 不是 header)
-            // 則檢查後續的 flags 欄位是否合理
-            if (data.Length >= 24)
+            // 嘗試從 offset 0 和 offset 1 解析
+            for (int startOff = 0; startOff <= 1; startOff++)
             {
-                // 嘗試判斷是否已有 header
-                // 典型的 header: 00 00 00 00 (type=0, flags=0)
-                // 典型的 codePage: 00 00 00 00
-                // 無法直接區分，一律假設第 1 組 4-bytes 是 header
-                // 如果第 5-8 bytes 也是 0x00 (flags 常見值=0)，那第 1 組可能就是 header
-                // 但如果 cbDomain/cbUserName 等比值合理，就當作已包含 header
-                offset = 4;
+                if (startOff + 18 > data.Length)
+                    break;
+
+                int cbDomain = BitConverter.ToUInt16(data, startOff + 8);
+                int cbUserName = BitConverter.ToUInt16(data, startOff + 10);
+                int cbPassword = BitConverter.ToUInt16(data, startOff + 12);
+                int cbAltShell = BitConverter.ToUInt16(data, startOff + 14);
+                int cbWorkingDir = BitConverter.ToUInt16(data, startOff + 16);
+
+                // 驗證 cb 值是否合理
+                if (cbUserName <= 0 || cbUserName > 512) continue;
+                if (cbPassword < 0 || cbPassword > 512) continue;
+                if (cbDomain < 0 || cbDomain > 512) continue;
+
+                // 從 cb 欄位結束處開始找字串起始 (跳過可能的 padding)
+                int strStart = startOff + 18;
+                while (strStart < data.Length && data[strStart] == 0)
+                    strStart++;
+
+                // 確保有足夠空間容納所有字串
+                int totalStrLen = cbDomain + cbUserName + cbPassword + cbAltShell + cbWorkingDir;
+                if (strStart + totalStrLen + 16 > data.Length)
+                    continue;
+
+                var domain = cbDomain > 0
+                    ? Encoding.Unicode.GetString(data, strStart, cbDomain).TrimEnd('\0')
+                    : "";
+                strStart += cbDomain;
+                // 跳過字串間的 null terminator/padding
+                while (strStart < data.Length && data[strStart] == 0) strStart++;
+
+                var username = cbUserName > 0
+                    ? Encoding.Unicode.GetString(data, strStart, cbUserName).TrimEnd('\0')
+                    : "";
+                strStart += cbUserName;
+                // 跳過字串間的 null terminator/padding
+                while (strStart < data.Length && data[strStart] == 0) strStart++;
+
+                var password = cbPassword > 0
+                    ? Encoding.Unicode.GetString(data, strStart, cbPassword).TrimEnd('\0')
+                    : "";
+
+                // 剔除無效的 uniCode 填充
+                username = SanitizeString(username);
+                password = SanitizeString(password);
+                domain = SanitizeString(domain);
+
+                if (!string.IsNullOrEmpty(username) || !string.IsNullOrEmpty(password))
+                    return new CapturedCredential(username, password, domain, null);
             }
 
-            // 需要至少 20 bytes (codePage + flags + 5*cb)
-            if (offset + 20 > data.Length)
-                return null;
-
-            // Skip codePage (4) + flags (4)
-            offset += 8;
-
-            int cbDomain = BitConverter.ToUInt16(data, offset); offset += 2;
-            int cbUserName = BitConverter.ToUInt16(data, offset); offset += 2;
-            int cbPassword = BitConverter.ToUInt16(data, offset); offset += 2;
-            int cbAltShell = BitConverter.ToUInt16(data, offset); offset += 2;
-            int cbWorkingDir = BitConverter.ToUInt16(data, offset); offset += 2;
-
-            var domain = cbDomain > 0 && offset + cbDomain <= data.Length
-                ? Encoding.Unicode.GetString(data, offset, cbDomain).TrimEnd('\0')
-                : "";
-            offset += cbDomain;
-
-            var username = cbUserName > 0 && offset + cbUserName <= data.Length
-                ? Encoding.Unicode.GetString(data, offset, cbUserName).TrimEnd('\0')
-                : "";
-            offset += cbUserName;
-
-            var password = cbPassword > 0 && offset + cbPassword <= data.Length
-                ? Encoding.Unicode.GetString(data, offset, cbPassword).TrimEnd('\0')
-                : "";
-            offset += cbPassword;
-
-            // 剔除無效的 uniCode 填充
-            username = SanitizeString(username);
-            password = SanitizeString(password);
-            domain = SanitizeString(domain);
-
-            if (string.IsNullOrEmpty(username) && string.IsNullOrEmpty(password))
-                return null;
-
-            return new CapturedCredential(username, password, domain, null);
+            return null;
         }
         catch
         {
