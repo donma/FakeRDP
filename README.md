@@ -17,7 +17,11 @@
   - **SSL/TLS 安全**：TLS 1.2（RSA 憑證 + ECDHE）→ TLS 通道內直接讀取 Info PDU
   - **NLA/CredSSP（部分）**：處理 NTLM Type 1/2/3，擷取 **帳號與網域**（密碼需 TSCredentials，現代 mstsc 因 SPNEGO mechListMIC 通常拒絕後續交換）
 - **完整擷取資訊**：來源 IP、來源連接埠、目標連接埠、帳號、密碼、網域、Cookie、時間戳
-- **Console 即時顯示**：成功擷取憑證時以紅字顯示在終端機
+- **Console 即時顯示**：成功擷取憑證時以紅字即時顯示來源 IP、來源 Port、目標 Port、帳號、網域與密碼；程式預設為遮罩，授權測試可設定 `consoleCredentialMode=full`
+- **協定遙測**：Session log 記錄 requested/selected protocol、Cookie/mstshash、TLS protocol/cipher suite、certificate thumbprint 與 state transition
+- **Profile 一致性驗證**：啟動時拒絕 NLA 無 TLS、未實作 Hybrid-Ex、未實作 RDSTLS、無效憑證參數或身份不一致設定
+- **Scanner compatibility harness**：提供 X.224、TLS、CredSSP challenge、MCS、多 Port 與資源限制的 PowerShell 測試工具
+- **自動回歸測試**：新增 `RdpHoneypot.Tests`，涵蓋協定選擇、RDP_NEG_FAILURE、憑證持久化、MCS builder、credential parser 與資源限制
 - **雙檔記錄**：JSONL 匯總檔 + 每 session 獨立目錄（文字日誌 + 原始封包）
 - **資源保護（高併發防耗盡）**：
   - 全域 Session 上限（`SessionLimiter`，預設 2000 併發）
@@ -83,6 +87,41 @@ nmap -Pn -p 4499 --script rdp-enum-encryption <AUTHORIZED_HOST>
 - RDP security protocol 資訊
 
 Scanner 能辨識出 RDP 服務不代表完整桌面登入已實作；本專案的目的只完成足夠的協定階段以記錄授權測試中的登入嘗試。
+
+完整的 scanner baseline、實測結果與限制請參考 [`docs/scanner-compatibility.md`](docs/scanner-compatibility.md)，可重複執行的 PowerShell harness 位於 [`tools/scanner-test/`](tools/scanner-test/)。協定與資源 regression executable 可用以下命令執行：
+
+```powershell
+dotnet run --project .\RdpHoneypot.Tests -c Release
+```
+
+Scanner harness：
+
+```powershell
+.\tools\scanner-test\run-tests.ps1 `
+    -TargetHost 127.0.0.1 `
+    -Port '4499,4500,13389' `
+    -SkipNmap
+```
+
+若已安裝 Nmap，移除 `-SkipNmap` 後會執行：
+
+```text
+nmap -Pn -p <PORT> <HOST>
+nmap -Pn -sV -p <PORT> <HOST>
+nmap -Pn -sV --version-all -p <PORT> <HOST>
+nmap -Pn -p <PORT> --script rdp-enum-encryption <HOST>
+nmap -Pn -p <PORT> --script ssl-cert <HOST>
+```
+
+結果會寫入 `tools/scanner-test/results/scanner-result.json`；未安裝 Nmap 或未執行的檢查會標記為 `NOT_RUN`，不會冒充 PASS。
+
+Standard Security credential regression（只使用合成帳密）：
+
+```powershell
+dotnet run --project .\RdpHoneypot.Tests -c Release -- --integration `
+    --host 127.0.0.1 --port 13389 `
+    --log-dir .\bin\Release\net10.0\integration-test-logs
+```
 
 > 請勿掃描或誘導未授權的外部系統。對外部署前，應搭配防火牆、隔離網段及明確的客戶授權範圍。
 
@@ -275,6 +314,7 @@ Scanner 判定為 RDP 服務，不代表本專案提供完整 Windows 桌面；�
   "idleTimeoutSeconds": 20,
   "eventQueueCapacity": 100000,
   "enableRawCapture": false,
+  "consoleCredentialMode": "full",
   "logDir": null,
   "profile": {
     "computerName": "WIN-SRV01",
@@ -285,6 +325,8 @@ Scanner 判定為 RDP 服務，不代表本專案提供完整 Windows 桌面；�
     "enableHybridEx": false,
     "certificateSubject": "CN=WIN-SRV01",
     "certificatePath": "certs/test-rdp.pfx",
+    "sanDnsNames": [],
+    "rsaKeySize": 2048,
     "persistCertificate": true,
     "certificateLifetimeDays": 365,
     "certificateRenewalDays": 30,
@@ -311,6 +353,7 @@ Scanner 判定為 RDP 服務，不代表本專案提供完整 Windows 桌面；�
 | `idleTimeoutSeconds` | 整數 | `20` | 其他階段閒置逾時 |
 | `eventQueueCapacity` | 整數 | `100000` | 事件佇列容量（預留 Wave 2 使用） |
 | `enableRawCapture` | 布林 | `false` | 是否記錄原始封包（預設關閉，避免磁碟反壓） |
+| `consoleCredentialMode` | 字串 | `masked` | Console 密碼顯示模式：預設 `masked`；授權測試若需即時顯示明文可設定 `full` |
 | `logDir` | 字串或 null | `null` | 記錄輸出目錄（null = exe 所在目錄） |
 | `profile` | 物件 | 見下表 | 服務指紋、協定選擇、憑證與時序設定 |
 
@@ -326,6 +369,8 @@ Scanner 判定為 RDP 服務，不代表本專案提供完整 Windows 桌面；�
 | `enableHybridEx` | 布林 | `false` | 是否宣告/接受 Hybrid-Ex；預設不冒充未實作能力 |
 | `certificateSubject` | 字串/null | `CN=WIN-SRV01` | TLS 自簽憑證 Subject |
 | `certificatePath` | 字串/null | `certs/test-rdp.pfx` | PFX 路徑；相對路徑以啟動目錄為基準 |
+| `sanDnsNames` | 字串陣列 | `[]` | 額外 SAN DNS 名稱；ComputerName 永遠是主要 SAN |
+| `rsaKeySize` | 整數 | `2048` | 目前實作固定使用 RSA 2048 |
 | `persistCertificate` | 布林 | `true` | 是否保存/重用 TLS PFX |
 
 > `certs/test-rdp.pfx` 是刻意提交的公開測試憑證，包含測試私鑰，只能在隔離測試環境使用。正式或客戶環境請改用部署專用憑證，並將其加入 `.gitignore`。
@@ -335,6 +380,8 @@ Scanner 判定為 RDP 服務，不代表本專案提供完整 Windows 桌面；�
 | `responseDelayMaxMs` | 整數 | `120` | MCS 回應前 jitter 上限（0~2000） |
 | `disconnectMode` | 字串 | `capture_and_close` | 擷取後的本 honeypot 連線結束模式 |
 | `disconnectDelayMs` | 整數 | `0` | 結束前延遲（0~10000ms） |
+
+> 目前 repository 的 `config.json` 為了授權測試 console 即時顯示而使用 `consoleCredentialMode=full`。一般部署建議改回 `masked`；`full` 只應在隔離且獲授權的測試環境使用。
 
 `disconnectMode` 可用值：
 
@@ -349,6 +396,27 @@ Scanner 判定為 RDP 服務，不代表本專案提供完整 Windows 桌面；�
 > **資源降級行為**：當 `maxConcurrentSessions`、`maxConcurrentPerIp` 或 `maxConcurrentPerSubnet` 任一達上限時，新連線仍會收到 X.224 Connection Confirm（掃描器看到 RDP 服務），但不會繼續 TLS/MCS/Info PDU 處理，也不會建立 session 目錄或寫入任何檔案。
 >
 > **測試憑證注意事項**：`certs/test-rdp.pfx` 是刻意放入 repository 的公開測試憑證，包含私鑰，只能用於隔離測試；任何人都可以使用它冒充測試服務。正式環境請刪除它、改用自己的憑證並把 PFX 排除在版本控制之外。
+
+---
+
+## 新增的測試與工具檔案
+
+本次新增：
+
+- `RdpProtocol.cs`：RDP requested/selected protocol enum 與 negotiation failure reason。
+- `RdpServerProfileValidator.cs`：啟動時檢查 Profile、TLS/NLA 能力與憑證身份一致性。
+- `RdpHoneypot.Tests/`：不依賴第三方測試框架的 .NET regression executable。
+- `RdpHoneypot.Tests/IntegrationRunner.cs`：使用合成帳密驗證 Standard Security credential capture。
+- `docs/scanner-compatibility.md`：baseline、實測結果與限制。
+- `tools/scanner-test/run-tests.ps1`：TCP、X.224、TLS、CredSSP、MCS 與可選 Nmap probe。
+- `tools/scanner-test/resource-regression.ps1`：Global Session limit 與 lightweight X.224 回應測試。
+
+執行完整本地 regression：
+
+```powershell
+dotnet build -c Release
+dotnet run --project .\RdpHoneypot.Tests -c Release
+```
 
 ---
 

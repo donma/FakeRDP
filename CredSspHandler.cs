@@ -63,7 +63,7 @@ static class CredSspHandler
 
                 var password = DecryptTSCredentials(authInfo, session.TlsRsaKey);
                 if (password != null)
-                    await session.LogAsync($"  >>> TSCredentials password: {password}");
+                    await session.LogAsync($"  >>> TSCredentials password: {session.DisplaySecretForLog(password)}");
                 else
                 {
                     await session.LogAsync($"  (TSCredentials decryption failed, saving raw)");

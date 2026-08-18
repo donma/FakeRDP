@@ -4,10 +4,8 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <RootNamespace>RdpHoneypot</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Remove="RdpHoneypot.Tests\**" />
-    <None Update="certs\test-rdp.pfx" CopyToOutputDirectory="PreserveNewest" />
+    <ProjectReference Include="..\RdpHoneypot.csproj" />
   </ItemGroup>
 </Project>

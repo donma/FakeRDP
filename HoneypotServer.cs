@@ -41,10 +41,16 @@ sealed class HoneypotServer
         _tlsCert = CryptoHelper.CreateRsaCertForTls(
             subject,
             profile.ComputerName,
+            profile.SanDnsNames,
             certificatePath,
             profile.CertificateLifetimeDays,
             profile.CertificateRenewalDays,
+            profile.RsaKeySize,
             profile.PersistCertificate);
+        var certificateErrors = RdpServerProfileValidator.ValidateCertificate(
+            _tlsCert, subject, profile.ComputerName);
+        if (certificateErrors.Count > 0)
+            throw new InvalidOperationException($"TLS certificate validation failed: {string.Join("; ", certificateErrors)}");
         _tlsRsaKey = _tlsCert.GetRSAPrivateKey()!;
         _serverRandom = CryptoHelper.GenerateRandom(32);
     }
@@ -142,7 +148,7 @@ sealed class HoneypotServer
 
     /// <summary>讀取一個完整的 TPKT 封包，含硬限制與 timeout</summary>
     internal static async Task<byte[]?> ReadTpktAsync(Stream stream, FileStream? rawLog,
-        CancellationToken ct, int timeoutMs = 0)
+        CancellationToken ct, int timeoutMs = 0, int maxPacketBytes = 262_144)
     {
         using var timeoutCts = timeoutMs > 0
             ? CancellationTokenSource.CreateLinkedTokenSource(ct)
@@ -164,7 +170,7 @@ sealed class HoneypotServer
             await rawLog.WriteAsync(header, ct);
 
         int length = (header[2] << 8) | header[3];
-        if (length < 4 || length > 262_144) return null;
+        if (length < 4 || length > maxPacketBytes) return null;
 
         var body = new byte[length - 4];
         read = 0;

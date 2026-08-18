@@ -29,6 +29,11 @@ A defensive RDP honeypot written in C#/.NET 10. Deploy it only on networks and h
   - Raw packet capture disabled by default.
 - **Background event pipeline:** Credential events are sent to a bounded `Channel<T>` and written by a background recorder instead of making the network session wait for aggregate file I/O.
 - **Server profiles:** Configure the simulated computer name, domain, supported security modes, certificate identity, response jitter, and disconnect behavior.
+- **Profile consistency validation:** Startup rejects contradictory settings such as NLA without TLS, unimplemented Hybrid-Ex/RDSTLS, invalid certificate parameters, or mismatched certificate identity.
+- **Structured protocol telemetry:** Session logs include requested/selected RDP protocols, cookies, TLS protocol/cipher suite, certificate thumbprint, and state transitions without exposing passwords by default.
+- **Real-time console telemetry:** Credential events show source IP, source port, target port, username, domain, and password in the console; passwords are masked by default and may be explicitly enabled for authorized tests with `consoleCredentialMode=full`.
+- **Scanner compatibility harness:** PowerShell tools cover X.224, TLS, CredSSP challenge, MCS, multi-port probing, and resource-limit regression.
+- **Automated regression executable:** `RdpHoneypot.Tests` covers protocol selection, RDP_NEG_FAILURE, certificate persistence, MCS builders, credential parsing, and resource limits.
 - **No production-system modification:** The program does not create Windows services, modify the registry, or change firewall rules.
 
 ---
@@ -144,6 +149,41 @@ TCP reachability
 
 A scanner identifying the service as RDP does not mean that a full Windows desktop or authentication subsystem is implemented. The project intentionally stops after the protocol stages needed for defensive observation.
 
+See [`docs/scanner-compatibility.md`](docs/scanner-compatibility.md) for the scanner baseline, measured results, and limitations. The repeatable PowerShell harness is in [`tools/scanner-test/`](tools/scanner-test/). Run the protocol and resource regression executable with:
+
+```powershell
+dotnet run --project .\RdpHoneypot.Tests -c Release
+```
+
+Scanner harness:
+
+```powershell
+.\tools\scanner-test\run-tests.ps1 `
+    -TargetHost 127.0.0.1 `
+    -Port '4499,4500,13389' `
+    -SkipNmap
+```
+
+If Nmap is installed, omit `-SkipNmap` to run:
+
+```text
+nmap -Pn -p PORT HOST
+nmap -Pn -sV -p PORT HOST
+nmap -Pn -sV --version-all -p PORT HOST
+nmap -Pn -p PORT --script rdp-enum-encryption HOST
+nmap -Pn -p PORT --script ssl-cert HOST
+```
+
+Results are written to `tools/scanner-test/results/scanner-result.json`. Checks that are unavailable or not executed are recorded as `NOT_RUN`, never as a false PASS.
+
+Synthetic Standard Security credential regression:
+
+```powershell
+dotnet run --project .\RdpHoneypot.Tests -c Release -- --integration `
+    --host 127.0.0.1 --port 13389 `
+    --log-dir .\bin\Release\net10.0\integration-test-logs
+```
+
 Do not scan or lure unauthorized external systems.
 
 ---
@@ -193,6 +233,7 @@ Current `config.json` example:
   "idleTimeoutSeconds": 20,
   "eventQueueCapacity": 100000,
   "enableRawCapture": false,
+  "consoleCredentialMode": "full",
   "logDir": null,
   "profile": {
     "computerName": "WIN-SRV01",
@@ -203,6 +244,8 @@ Current `config.json` example:
     "enableHybridEx": false,
     "certificateSubject": "CN=WIN-SRV01",
     "certificatePath": "certs/test-rdp.pfx",
+    "sanDnsNames": [],
+    "rsaKeySize": 2048,
     "persistCertificate": true,
     "certificateLifetimeDays": 365,
     "certificateRenewalDays": 30,
@@ -231,6 +274,7 @@ Current `config.json` example:
 | `idleTimeoutSeconds` | `20` | Timeout for later idle stages. |
 | `eventQueueCapacity` | `100000` | Bounded background event queue capacity. |
 | `enableRawCapture` | `false` | Creates per-session `raw.bin` files when enabled. |
+| `consoleCredentialMode` | `masked` | Console password display mode: `masked` by default; set to `full` only for authorized testing. |
 | `logDir` | `null` | Output directory. `null` means the executable directory. |
 
 ### Profile options
@@ -245,6 +289,8 @@ Current `config.json` example:
 | `enableHybridEx` | `false` | Reserved for future Hybrid-Ex support; disabled by default. |
 | `certificateSubject` | `CN=WIN-SRV01` | TLS certificate subject. |
 | `certificatePath` | `certs/test-rdp.pfx` | PFX path; relative paths are resolved from the launch directory. |
+| `sanDnsNames` | `[]` | Additional DNS SANs; `computerName` remains the primary SAN. |
+| `rsaKeySize` | `2048` | Current implementation requires RSA 2048. |
 | `persistCertificate` | `true` | Save or reuse the TLS PFX. |
 | `certificateLifetimeDays` | `365` | Lifetime for a newly generated certificate. |
 | `certificateRenewalDays` | `30` | Regenerate when the certificate is close to expiry. |
@@ -253,6 +299,8 @@ Current `config.json` example:
 | `disconnectMode` | `capture_and_close` | Post-capture connection behavior. |
 | `disconnectDelayMs` | `0` | Delay before closing, from 0 to 10000 ms. |
 
+> The repository `config.json` currently uses `consoleCredentialMode=full` for the authorized interactive test. Use `masked` for normal deployments; `full` should be limited to isolated, explicitly authorized testing.
+
 ### Disconnect modes
 
 - `capture_and_close`: record the event and close the honeypot connection.
@@ -260,6 +308,27 @@ Current `config.json` example:
 - `shutdown_like`: use a delayed close sequence that resembles a server-side termination timing. It does not inject text into another host and cannot guarantee that `mstsc.exe` displays the exact localized message “The remote computer is shutting down.”
 
 The text and error code shown by the Windows RDP client are selected by the client from the protocol state. The honeypot cannot force an arbitrary client UI string by sending plain text.
+
+---
+
+## Added Tests and Tools
+
+This enhancement adds:
+
+- `RdpProtocol.cs`: typed requested/selected protocol values and negotiation failure reasons.
+- `RdpServerProfileValidator.cs`: startup validation for Profile, TLS/NLA capabilities, and certificate identity consistency.
+- `RdpHoneypot.Tests/`: a .NET regression executable with no third-party test framework dependency.
+- `RdpHoneypot.Tests/IntegrationRunner.cs`: synthetic Standard Security credential-capture integration test.
+- `docs/scanner-compatibility.md`: scanner baseline, measured results, and limitations.
+- `tools/scanner-test/run-tests.ps1`: TCP, X.224, TLS, CredSSP, MCS, and optional Nmap probes.
+- `tools/scanner-test/resource-regression.ps1`: global session-limit and lightweight X.224 response test.
+
+Run the local regression suite:
+
+```powershell
+dotnet build -c Release
+dotnet run --project .\RdpHoneypot.Tests -c Release
+```
 
 ---
 

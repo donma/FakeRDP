@@ -72,12 +72,16 @@ static class Program
                             "credSspTimeoutSeconds": 10,
                             "idleTimeoutSeconds": 20,
                             "enableRawCapture": false,
+                            "consoleCredentialMode": "masked",
                             "profile": {
                               "computerName": "WIN-SRV01",
                               "domainName": "WORKGROUP",
                               "enableTls": true,
                               "enableNla": true,
                               "enableStandardSecurity": true,
+                              "certificatePath": "certs/test-rdp.pfx",
+                              "sanDnsNames": [],
+                              "rsaKeySize": 2048,
                               "persistCertificate": true,
                               "responseDelayMinMs": 20,
                               "responseDelayMaxMs": 120
@@ -162,11 +166,20 @@ static class Program
             Console.Error.WriteLine("[錯誤] profile.computerName 必須是 1~63 字元");
             return 1;
         }
-        profile.ResponseDelayMinMs = Math.Clamp(profile.ResponseDelayMinMs, 0, 2000);
-        profile.ResponseDelayMaxMs = Math.Clamp(profile.ResponseDelayMaxMs, profile.ResponseDelayMinMs, 2000);
-        profile.CertificateLifetimeDays = Math.Clamp(profile.CertificateLifetimeDays, 1, 3650);
-        profile.CertificateRenewalDays = Math.Clamp(profile.CertificateRenewalDays, 0, profile.CertificateLifetimeDays);
         options.Profile = profile;
+        var profileErrors = RdpServerProfileValidator.Validate(profile);
+        if (profileErrors.Count > 0)
+        {
+            foreach (var error in profileErrors)
+                Console.Error.WriteLine($"[設定錯誤] {error}");
+            return 1;
+        }
+        if (!string.Equals(options.ConsoleCredentialMode, "masked", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(options.ConsoleCredentialMode, "full", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.Error.WriteLine("[設定錯誤] consoleCredentialMode 必須是 masked 或 full");
+            return 1;
+        }
 
         try
         {

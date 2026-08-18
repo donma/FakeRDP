@@ -38,19 +38,15 @@ static class RdpPacket
             ];
         }
 
-        // TPKT header (03 00) + 長度 + X.224 CC (0x0E) + MCS Connect Response 簡化版
-        // 這個封包結構是基於 RDP 協定標準的簡化實現
+        // Legacy X.224 Connection Confirm: no RDP_NEG_RSP is present when
+        // the client omitted an RDP negotiation request.
         return
         [
-            // TPKT + X.224 CC
-            0x03, 0x00, 0x00, 0x14, // TPKT (length 20 = 此陣列實際長度)
-            0x0E,                   // X.224 Connection Confirm (DT)
-            0xD0, 0x00,             // DST reference
-            0x00, 0x00,             // SRC reference
-            0x12, 0x34,             // Class & options
-            0x00,                   // Extended options
-            // MCS Connect Response fragment (讓 client 繼續握手)
-            0x02, 0x09, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00
+            0x03, 0x00, 0x00, 0x0B,
+            0x06, 0xD0,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00
         ];
     }
 
@@ -79,9 +75,18 @@ static class RdpPacket
     /// 回傳 client 要求協商的協定 bitmask (0 = 無協商要求)
     /// RDP_NEG_REQ 位於 X.224 CR 的**最後 8 bytes**
     /// </summary>
+    public static bool HasNegotiationRequest(byte[] packet)
+    {
+        if (packet.Length < 19)
+            return false;
+        var offset = packet.Length - 8;
+        return packet[offset] == 0x01 && packet[offset + 1] == 0x00 &&
+               packet[offset + 2] == 0x08 && packet[offset + 3] == 0x00;
+    }
+
     public static uint TryParseNegotiationRequest(byte[] packet)
     {
-        if (packet.Length < 19) return 0;
+        if (!HasNegotiationRequest(packet)) return 0;
 
         int offset = packet.Length - 8;
         if (offset < 0) return 0;
@@ -93,12 +98,9 @@ static class RdpPacket
         if (packet[offset] == 0x01 && packet[offset + 1] == 0x00 &&
             packet[offset + 2] == 0x08 && packet[offset + 3] == 0x00)
         {
-            uint protocols = BitConverter.ToUInt32(packet, offset + 4);
-            // 已知協定位元：SSL/TLS=0x01、HYBRID/NLA=0x02、
-            // RDSTLS=0x04、HYBRID_EX=0x08。
-            // 本蜜罐只會選擇實際支援的 SSL/HYBRID，其他位元保留給選擇器判斷。
-            if ((protocols & 0x0F) != 0)
-                return protocols;
+            // 保留 client 原始 bitmask，包含未知位元；選擇器會拒絕
+            // 未實作能力，而不是把它誤判成 legacy Standard Security。
+            return BitConverter.ToUInt32(packet, offset + 4);
         }
         return 0;
     }
@@ -140,7 +142,9 @@ static class RdpPacket
     /// 
     /// useTls=true 時: TLS 已提供加密，Server Security Data 不包含 RSA 憑證 (certLen=0)
     /// </summary>
-    public static byte[] BuildMCSConnectResponse(X509Certificate2 cert, RSA rsaKey, byte[] serverRandom, bool useTls = false)
+    public static byte[] BuildMCSConnectResponse(
+        X509Certificate2 cert, RSA rsaKey, byte[] serverRandom,
+        bool useTls = false, RdpSelectedProtocol selectedProtocol = RdpSelectedProtocol.Ssl)
     {
         // 1. 建構 Server Security Data。
         // TLS/SSL 模式只包含 method + level；RDP 標準安全模式另外包含
@@ -183,7 +187,7 @@ static class RdpPacket
         };
 
         // 5. 建構 GCC blocks，再包成 T.124 ConferenceCreateResponse。
-        var serverDataBlocks = BuildGCCUserData(serverSecurityData, useTls);
+        var serverDataBlocks = BuildGCCUserData(serverSecurityData, useTls, selectedProtocol);
         var gccConferenceResponse = BuildGccConferenceCreateResponse(serverDataBlocks);
 
         // 6. 建構完整的 MCS Connect Response (含 X.224 Data + MCS 封裝)
@@ -211,7 +215,8 @@ static class RdpPacket
     }
 
     /// <summary>建構 GCC Server Data blocks (FreeRDP 順序: Core、Network、Security)</summary>
-    static byte[] BuildGCCUserData(byte[] serverSecurityData, bool useTls)
+    static byte[] BuildGCCUserData(
+        byte[] serverSecurityData, bool useTls, RdpSelectedProtocol selectedProtocol)
     {
         using var ms = new MemoryStream();
         var bw = new BinaryWriter(ms);
@@ -221,7 +226,7 @@ static class RdpPacket
         bw.Write((ushort)0x0C01);
         bw.Write((ushort)16);
         bw.Write(0x00080004);
-        bw.Write(useTls ? 1u : 0u); // PROTOCOL_SSL / PROTOCOL_RDP
+        bw.Write((uint)selectedProtocol); // selected RDP security protocol
         bw.Write(0u);               // earlyCapabilityFlags
 
         // Server Network Data (SC_NET = 0x0C03)。MCS global channel 是 1003。
@@ -450,18 +455,44 @@ static class RdpPacket
         return packet[pos..];
     }
 
+    /// <summary>建構 MCS Attach User Confirm；userId 由 client request 動態回填。</summary>
+    public static byte[] BuildMcsAttachUserConfirm(ushort userId)
+    {
+        // TPKT + X.224 Data + MCS ATTACH_USER_CONFIRM (0x2E) + result + userId.
+        return
+        [
+            0x03, 0x00, 0x00, 0x0B,
+            0x02, 0xF0, 0x80,
+            0x2E, 0x00,
+            (byte)(userId >> 8), (byte)userId
+        ];
+    }
+
+    /// <summary>建構 MCS Channel Join Confirm，確認欄位回填 request channel。</summary>
+    public static byte[] BuildMcsChannelJoinConfirm(ushort initiator, ushort requestedChannel)
+    {
+        return
+        [
+            0x03, 0x00, 0x00, 0x0F,
+            0x02, 0xF0, 0x80,
+            0x3E, 0x00,
+            (byte)(initiator >> 8), (byte)initiator,
+            (byte)(requestedChannel >> 8), (byte)requestedChannel,
+            (byte)(requestedChannel >> 8), (byte)requestedChannel
+        ];
+    }
+
     /// <summary>
     /// 建構 Data Ack 回應 (讓 client 繼續流程)
     /// </summary>
     public static byte[] BuildDataAck()
     {
-        // 標準 Data Ack
-        // TPKT + X.224 DT (02 F0 80) + MCS Send Data Indication + empty
+        // 標準 Data Ack: TPKT + X.224 DT + MCS Send Data Indication + empty。
         return
         [
-            0x03, 0x00, 0x00, 0x0B, // TPKT (length 11)
-            0x02, 0xF0, 0x80,       // X.224 Data (LI=2, DT, eot)
-            0x04, 0x00, 0x00, 0x00  // MCS empty data
+            0x03, 0x00, 0x00, 0x0B,
+            0x02, 0xF0, 0x80,
+            0x04, 0x00, 0x00, 0x00
         ];
     }
 

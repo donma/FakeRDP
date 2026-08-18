@@ -1,6 +1,6 @@
 {
-  "ports": [4499, 4500, 4501],
-  "maxConcurrentSessions": 2000,
+  "ports": [13390],
+  "maxConcurrentSessions": 1,
   "maxConcurrentPerIp": 8,
   "maxConcurrentPerSubnet": 150,
   "maxPacketBytes": 262144,
@@ -10,10 +10,10 @@
   "mcsTimeoutSeconds": 5,
   "credSspTimeoutSeconds": 10,
   "idleTimeoutSeconds": 20,
-  "eventQueueCapacity": 100000,
+  "eventQueueCapacity": 1000,
   "enableRawCapture": false,
-  "consoleCredentialMode": "full",
-  "logDir": null,
+  "consoleCredentialMode": "masked",
+  "logDir": "bin/Release/net10.0/resource-regression-logs",
   "profile": {
     "computerName": "WIN-SRV01",
     "domainName": "WORKGROUP",
@@ -28,8 +28,8 @@
     "persistCertificate": true,
     "certificateLifetimeDays": 365,
     "certificateRenewalDays": 30,
-    "responseDelayMinMs": 20,
-    "responseDelayMaxMs": 120,
+    "responseDelayMinMs": 0,
+    "responseDelayMaxMs": 0,
     "disconnectMode": "capture_and_close",
     "disconnectDelayMs": 0
   }

@@ -19,6 +19,7 @@ sealed class HoneypotOptions
     public int IdleTimeoutSeconds { get; set; } = 20;
     public int EventQueueCapacity { get; set; } = 100_000;
     public bool EnableRawCapture { get; set; } = false;
+    public string ConsoleCredentialMode { get; set; } = "masked";
     public string? LogDir { get; set; }
     public RdpServerProfile Profile { get; set; } = new();
 }

@@ -19,8 +19,9 @@ static class McsHandler
         catch { }
 
         var response = RdpPacket.BuildMCSConnectResponse(
-            session.ServerCert, session.RsaKey, session.ServerRandom, state.UseTls);
-        state.Phase = SessionPhase.WaitErectDomain;
+            session.ServerCert, session.RsaKey, session.ServerRandom,
+            state.UseTls, state.SelectedProtocol);
+        session.TransitionTo(SessionPhase.WaitErectDomain);
         return response;
     }
 
@@ -29,10 +30,10 @@ static class McsHandler
         var state = session.State;
         if (packet.Length < 8 || packet[7] != 0x04)
         {
-            state.Phase = SessionPhase.WaitAttachUser;
+            session.TransitionTo(SessionPhase.WaitAttachUser);
             return HandleAttachUser(session, packet);
         }
-        state.Phase = SessionPhase.WaitAttachUser;
+        session.TransitionTo(SessionPhase.WaitAttachUser);
         return null;
     }
 
@@ -41,11 +42,15 @@ static class McsHandler
         var state = session.State;
         if (packet.Length < 8 || packet[7] != 0x28)
         {
-            state.Phase = SessionPhase.Error;
+            session.TransitionTo(SessionPhase.Error);
             return null;
         }
-        state.Phase = SessionPhase.WaitChannelJoin;
-        return [0x03, 0x00, 0x00, 0x0B, 0x02, 0xF0, 0x80, 0x2E, 0x00, 0x00, 0x01];
+        if (packet.Length >= 12)
+            state.UserId = (ushort)((packet[10] << 8) | packet[11]);
+        if (state.UserId == 0)
+            state.UserId = 1001;
+        session.TransitionTo(SessionPhase.WaitChannelJoin);
+        return RdpPacket.BuildMcsAttachUserConfirm(state.UserId);
     }
 
     public static byte[]? HandleChannelJoin(RdpSession session, byte[] packet)
@@ -53,18 +58,16 @@ static class McsHandler
         var state = session.State;
         if (packet.Length < 8 || packet[7] != 0x38 || packet.Length < 12)
         {
-            state.Phase = SessionPhase.Error;
+            session.TransitionTo(SessionPhase.Error);
             return null;
         }
 
         var requestedChannel = (ushort)((packet[10] << 8) | packet[11]);
         state.ChannelId = requestedChannel;
-        state.Phase = (requestedChannel == 1003)
+        session.TransitionTo(requestedChannel == 1003
             ? SessionPhase.WaitSecurityExchange
-            : SessionPhase.WaitChannelJoin;
+            : SessionPhase.WaitChannelJoin);
 
-        return [0x03, 0x00, 0x00, 0x0F, 0x02, 0xF0, 0x80, 0x3E, 0x00, 0x00, 0x01,
-            (byte)(requestedChannel >> 8), (byte)requestedChannel,
-            (byte)(requestedChannel >> 8), (byte)requestedChannel];
+        return RdpPacket.BuildMcsChannelJoinConfirm(state.UserId, requestedChannel);
     }
 }

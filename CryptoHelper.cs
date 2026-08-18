@@ -30,7 +30,7 @@ static class CryptoHelper
         var rsa = RSA.Create(2048);
 
         var req = new CertificateRequest(
-            "CN=MS-Server, O=Microsoft Corporation",
+            "CN=RDP-Server",
             rsa,
             HashAlgorithmName.SHA256,
             RSASignaturePadding.Pkcs1);
@@ -47,6 +47,18 @@ static class CryptoHelper
         return (rsa, cert);
     }
 
+    static bool HasDnsNames(X509Certificate2 certificate, string primary, IReadOnlyCollection<string>? additional)
+    {
+        var san = certificate.Extensions.OfType<X509SubjectAlternativeNameExtension>().FirstOrDefault();
+        if (san is null)
+            return false;
+        var actual = san.EnumerateDnsNames().ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (!actual.Contains(primary))
+            return false;
+        return (additional ?? []).Where(name => !string.IsNullOrWhiteSpace(name))
+            .All(actual.Contains);
+    }
+
     /// <summary>
     /// 建立或載入持久化 RSA TLS 憑證。
     /// 憑證檔案只在需要時建立；私鑰以 PFX + PersistKeySet 載入，
@@ -55,9 +67,11 @@ static class CryptoHelper
     public static X509Certificate2 CreateRsaCertForTls(
         string subject,
         string sanName,
+        IReadOnlyCollection<string>? sanDnsNames,
         string? certificatePath,
         int lifetimeDays,
         int renewalDays,
+        int rsaKeySize,
         bool persist)
     {
         if (persist && !string.IsNullOrWhiteSpace(certificatePath) && File.Exists(certificatePath))
@@ -69,7 +83,12 @@ static class CryptoHelper
                     null,
                     X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet);
                 var subjectMatches = existing.Subject.Equals(subject, StringComparison.OrdinalIgnoreCase);
-                if (existing.HasPrivateKey && subjectMatches &&
+                var keySizeMatches = existing.GetRSAPublicKey()?.KeySize == rsaKeySize;
+                var expectedPrimarySan = string.IsNullOrWhiteSpace(sanName)
+                    ? subject.Replace("CN=", "", StringComparison.OrdinalIgnoreCase).Split(',', 2)[0].Trim()
+                    : sanName;
+                var sanMatches = HasDnsNames(existing, expectedPrimarySan, sanDnsNames);
+                if (existing.HasPrivateKey && subjectMatches && keySizeMatches && sanMatches &&
                     existing.NotAfter > DateTime.UtcNow.AddDays(renewalDays))
                     return existing;
                 existing.Dispose();
@@ -80,7 +99,7 @@ static class CryptoHelper
             }
         }
 
-        using var rsa = RSA.Create(2048);
+        using var rsa = RSA.Create(rsaKeySize);
         var req = new CertificateRequest(
             subject,
             rsa,
@@ -99,7 +118,14 @@ static class CryptoHelper
         var defaultName = subject.StartsWith("CN=", StringComparison.OrdinalIgnoreCase)
             ? subject[3..].Split(',', 2)[0].Trim()
             : subject;
-        sanBuilder.AddDnsName(string.IsNullOrWhiteSpace(sanName) ? defaultName : sanName);
+        var primarySan = string.IsNullOrWhiteSpace(sanName) ? defaultName : sanName;
+        sanBuilder.AddDnsName(primarySan);
+        foreach (var dnsName in sanDnsNames ?? [])
+        {
+            if (!string.IsNullOrWhiteSpace(dnsName) &&
+                !dnsName.Equals(primarySan, StringComparison.OrdinalIgnoreCase))
+                sanBuilder.AddDnsName(dnsName);
+        }
         req.CertificateExtensions.Add(
             new X509SubjectAlternativeNameExtension(sanBuilder.Build().RawData, false));
 
@@ -130,7 +156,7 @@ static class CryptoHelper
         using var ecdsa = ECDsa.Create(ECCurve.NamedCurves.nistP256);
 
         var req = new CertificateRequest(
-            "CN=MS-Server, O=Microsoft Corporation",
+            "CN=RDP-Server",
             ecdsa,
             HashAlgorithmName.SHA256);
 

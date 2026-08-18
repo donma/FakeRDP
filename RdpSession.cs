@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Text.Json;
 
 namespace RdpHoneypot;
 
@@ -73,17 +74,22 @@ sealed class RdpSession
 
                 // ── Phase 1: X.224 Connection Request ──
                 var x224 = await HoneypotServer.ReadTpktAsync(rawStream, null, ct,
-                    _options.X224TimeoutSeconds * 1000);
+                    _options.X224TimeoutSeconds * 1000, _options.MaxPacketBytes);
                 if (x224 == null) return;
 
                 var neg = X224Handler.ParseConnectionRequest(x224, Profile);
                 _state.UseNla = neg.UseNla;
                 _state.ClientInfo = neg.ClientInfo;
+                _state.RawCookie = neg.RawCookie;
+                _state.Mstshash = neg.Mstshash;
+                _state.RequestedProtocols = neg.RequestedProtocols;
+                _state.SelectedProtocol = neg.SelectedProtocol;
                 bool useSecureChannel = neg.UseTls || neg.UseNla;
 
                 if (!neg.IsSupported)
                 {
-                    var failure = X224Handler.BuildFailureResponse(0x00000002); // HYBRID_REQUIRED / unsupported
+                    var failure = X224Handler.BuildFailureResponse(
+                        neg.FailureReason ?? RdpNegotiationFailureReason.InconsistentFlags);
                     await rawStream.WriteAsync(failure, ct);
                     return;
                 }
@@ -93,7 +99,13 @@ sealed class RdpSession
                 await rawStream.WriteAsync(cc, ct);
 
                 // ── Admission Control ──
-                _admitted = _limiter.TryEnter() && _tracker.TryAcquire(_ep.Address);
+                // Roll back a partially acquired global slot if the per-IP/subnet
+                // admission check rejects the connection.
+                var limiterAcquired = _limiter.TryEnter();
+                var trackerAcquired = limiterAcquired && _tracker.TryAcquire(_ep.Address);
+                if (!trackerAcquired && limiterAcquired)
+                    _limiter.Exit();
+                _admitted = limiterAcquired && trackerAcquired;
                 if (!_admitted)
                 {
                     Console.WriteLine($"  [{_id}] Lightweight: admission limit reached, X.224 CC sent");
@@ -114,6 +126,13 @@ sealed class RdpSession
                 await LogText($"  ([{SessionPhase.WaitX224}] RX {x224.Length} bytes)");
                 await LogText($"  ([{SessionPhase.WaitX224}] TX {cc.Length} bytes" +
                     $"{(useSecureChannel ? (neg.UseNla ? ", CredSSP/NLA" : ", SSL/TLS") : ", standard")})");
+                await LogTelemetry("X224Accepted", new
+                {
+                    requestedProtocols = ProtocolNames(neg.RequestedProtocols),
+                    selectedProtocol = neg.SelectedProtocol.ToString(),
+                    rawCookie = neg.RawCookie,
+                    mstshash = neg.Mstshash
+                });
 
                 // ── Phase 2: TLS 握手 ──
                 Stream stream = rawStream;
@@ -136,11 +155,19 @@ sealed class RdpSession
                         stream = ssl;
                         _state.UseTls = true;
                         await LogText($"  (TLS handshake established: {ssl.NegotiatedCipherSuite})");
+                        await LogTelemetry("tls_established", new
+                        {
+                            protocol = ssl.SslProtocol.ToString(),
+                            cipherSuite = ssl.NegotiatedCipherSuite.ToString(),
+                            certificateThumbprint = _tlsCert.Thumbprint,
+                            requestedRdpProtocol = ProtocolNames(_state.RequestedProtocols),
+                            selectedRdpProtocol = _state.SelectedProtocol.ToString()
+                        });
                     }
                     catch (Exception ex)
                     {
                         await LogText($"  (!) TLS handshake failed: {ex.Message}");
-                        _state.Phase = SessionPhase.Error;
+                        TransitionTo(SessionPhase.Error);
                     }
                 }
 
@@ -152,16 +179,16 @@ sealed class RdpSession
                     {
                         SaveNlaCredential(creds.Value.domain, creds.Value.username, creds.Value.password);
                         var msg = creds.Value.password != null
-                            ? $"  >>> NLA credential: {creds.Value.domain}\\{creds.Value.username}:{creds.Value.password}"
+                            ? $"  >>> NLA credential: {creds.Value.domain}\\{creds.Value.username}:{DisplaySecret(creds.Value.password)}"
                             : $"  >>> NLA account: {creds.Value.domain}\\{creds.Value.username}";
                         await LogText(msg);
                     }
-                    _state.Phase = SessionPhase.Done;
+                    TransitionTo(SessionPhase.Done);
                 }
 
                 // ── Phase 3+: 主循環 (MCS → 安全交換 → Info PDU) ──
                 if (!neg.UseNla)
-                    _state.Phase = SessionPhase.WaitMCS;
+                    TransitionTo(SessionPhase.WaitMCS);
 
                 while (!ct.IsCancellationRequested &&
                        _state.Phase != SessionPhase.Error &&
@@ -175,7 +202,8 @@ sealed class RdpSession
                         _ => _options.IdleTimeoutSeconds * 1000
                     };
 
-                    var tpkt = await HoneypotServer.ReadTpktAsync(stream, _rawLog, ct, phaseTimeoutMs);
+                    var tpkt = await HoneypotServer.ReadTpktAsync(
+                        stream, _rawLog, ct, phaseTimeoutMs, _options.MaxPacketBytes);
                     if (tpkt == null) break;
 
                     if (_rawLog != null) _rawBytesWritten += tpkt.Length;
@@ -201,7 +229,7 @@ sealed class RdpSession
 
                     if (_state.Credential != null)
                     {
-                        await LogText($"  >>> CAPTURED credential: {_state.Credential}");
+                        await LogText($"  >>> CAPTURED credential: {FormatCredentialForLog(_state.Credential)}");
                         SaveCredential(_state.Credential);
                         await RdpDisconnectHandler.ApplyAfterCaptureAsync(this, ct);
                         _state.Credential = null;
@@ -262,7 +290,7 @@ sealed class RdpSession
         Console.WriteLine($"  ═══ CREDENTIAL CAPTURED ═══");
         Console.WriteLine($"  IP: {_ep.Address}:{_ep.Port} -> port {_localPort}");
         Console.WriteLine($"  User: {cred.Username}");
-        Console.WriteLine($"  Pass: {cred.Password}");
+        Console.WriteLine($"  Pass: {DisplaySecret(cred.Password)}");
         Console.WriteLine($"  Domain: {cred.Domain}");
         Console.ResetColor();
     }
@@ -282,13 +310,59 @@ sealed class RdpSession
             Console.ForegroundColor = ConsoleColor.Red;
             Console.WriteLine($"  ═══ NLA CREDENTIAL CAPTURED ═══");
             Console.WriteLine($"  IP: {_ep.Address}:{_ep.Port} -> port {_localPort}");
-            Console.WriteLine($"  User: {username}"); Console.WriteLine($"  Pass: {password}");
+            Console.WriteLine($"  User: {username}"); Console.WriteLine($"  Pass: {DisplaySecret(password)}");
             Console.WriteLine($"  Domain: {domain}");
             Console.ResetColor();
         }
     }
 
+    string DisplaySecret(string? secret)
+        => string.Equals(_options.ConsoleCredentialMode, "full", StringComparison.OrdinalIgnoreCase)
+            ? secret ?? "<empty>"
+            : "********";
+
+    string FormatCredentialForLog(CapturedCredential? credential)
+        => credential is null
+            ? "<none>"
+            : $"{credential.Domain}\\{credential.Username}:{DisplaySecret(credential.Password)}";
+
+    internal string DisplaySecretForLog(string? secret) => DisplaySecret(secret);
+
     internal Task LogAsync(string line) => LogText(line);
+
+    internal void TransitionTo(SessionPhase phase)
+    {
+        _state.Phase = phase;
+        _ = LogTelemetry("state_transition", new { phase = phase.ToString() });
+    }
+
+    async Task LogTelemetry(string eventName, object data)
+    {
+        var payload = new Dictionary<string, object?>
+        {
+            ["event"] = eventName,
+            ["sessionId"] = _id,
+            ["remoteIp"] = _ep.Address.ToString(),
+            ["localPort"] = _localPort,
+            ["timestamp"] = DateTime.UtcNow
+        };
+        foreach (var property in data.GetType().GetProperties())
+            payload[property.Name] = property.GetValue(data);
+        await LogText($"  [telemetry] {JsonSerializer.Serialize(payload)}");
+    }
+
+    static string[] ProtocolNames(RdpRequestedProtocol protocols)
+    {
+        if (protocols == RdpRequestedProtocol.Standard)
+            return ["STANDARD"];
+        var names = new List<string>();
+        foreach (var value in Enum.GetValues<RdpRequestedProtocol>())
+        {
+            if (value != RdpRequestedProtocol.Standard && protocols.HasFlag(value))
+                names.Add(value.ToString().ToUpperInvariant());
+        }
+        return [.. names];
+    }
 
     Task LogText(string line)
     {
@@ -332,6 +406,10 @@ class RdpSessionState
     public byte[]? EncryptKey { get; set; }
     public bool UseTls { get; set; }
     public bool UseNla { get; set; }
+    public string? RawCookie { get; set; }
+    public string? Mstshash { get; set; }
+    public RdpRequestedProtocol RequestedProtocols { get; set; }
+    public RdpSelectedProtocol SelectedProtocol { get; set; }
     public ushort UserId { get; set; }
     public ushort ChannelId { get; set; }
     public CapturedCredential? Credential { get; set; }

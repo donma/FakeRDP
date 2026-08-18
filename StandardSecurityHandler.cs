@@ -107,7 +107,7 @@ static class StandardSecurityHandler
                 Console.ForegroundColor = ConsoleColor.Red;
                 Console.WriteLine($"  ═══ CREDENTIAL CAPTURED ═══");
                 Console.WriteLine($"  User: {cred.Username}");
-                Console.WriteLine($"  Pass: {cred.Password}");
+                Console.WriteLine($"  Pass: {session.DisplaySecretForLog(cred.Password)}");
                 Console.WriteLine($"  Domain: {cred.Domain}");
                 Console.ResetColor();
             }
