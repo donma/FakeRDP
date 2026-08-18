@@ -12,5 +12,21 @@
   "idleTimeoutSeconds": 20,
   "eventQueueCapacity": 100000,
   "enableRawCapture": false,
-  "logDir": null
+  "logDir": null,
+  "profile": {
+    "computerName": "WIN-SRV01",
+    "domainName": "WORKGROUP",
+    "enableTls": true,
+    "enableNla": true,
+    "enableStandardSecurity": true,
+    "enableHybridEx": false,
+    "certificateSubject": "CN=WIN-SRV01",
+    "persistCertificate": true,
+    "certificateLifetimeDays": 365,
+    "certificateRenewalDays": 30,
+    "responseDelayMinMs": 20,
+    "responseDelayMaxMs": 120,
+    "disconnectMode": "capture_and_close",
+    "disconnectDelayMs": 0
+  }
 }

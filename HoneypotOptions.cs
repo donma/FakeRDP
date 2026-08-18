@@ -20,4 +20,5 @@ sealed class HoneypotOptions
     public int EventQueueCapacity { get; set; } = 100_000;
     public bool EnableRawCapture { get; set; } = false;
     public string? LogDir { get; set; }
+    public RdpServerProfile Profile { get; set; } = new();
 }

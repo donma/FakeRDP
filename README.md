@@ -57,7 +57,7 @@ dotnet build -c Release
 bin\Release\net10.0\RdpHoneypot.exe --port 4499,4500,4501
 ```
 
-Log 預設寫在 **exe 同層目錄**（`bin\Release\net10.0\`），感謝您並未指定 `--output`。
+Log 預設寫在 **exe 同層目錄**（`bin\Release\net10.0\`）。
 
 ### 3. 測試連線
 
@@ -66,6 +66,25 @@ mstsc /v:<伺服器IP>:4499
 ```
 
 輸入帳號密碼後，蜜罐會在 console 以紅字顯示擷取到的帳密。
+
+### 4. 授權環境中的 RDP Scanner 驗證
+
+只在自己擁有或明確授權的主機與網路上執行。先確認 TCP port：
+
+```bash
+nmap -Pn -p 4499 --script rdp-enum-encryption <AUTHORIZED_HOST>
+```
+
+預期可以觀察到：
+
+- TCP port reachable/open
+- X.224 / RDP negotiation response
+- TLS server certificate
+- RDP security protocol 資訊
+
+Scanner 能辨識出 RDP 服務不代表完整桌面登入已實作；本專案的目的只完成足夠的協定階段以記錄授權測試中的登入嘗試。
+
+> 請勿掃描或誘導未授權的外部系統。對外部署前，應搭配防火牆、隔離網段及明確的客戶授權範圍。
 
 ---
 
@@ -91,6 +110,152 @@ RdpHoneypot.exe --port 4499,4500,4501 --output D:\honeypot-logs
 
 ---
 
+## 完整使用教學
+
+以下流程以 Windows PowerShell 為例，所有測試都必須在自己擁有或明確授權的網路中執行。
+
+### A. 從原始碼編譯並啟動
+
+在專案根目錄執行：
+
+```powershell
+dotnet build -c Release
+Copy-Item .\config.json .\bin\Release\net10.0\config.json -Force
+Set-Location .\bin\Release\net10.0
+.\RdpHoneypot.exe
+```
+
+也可以不發布 exe，直接使用 SDK 執行：
+
+```powershell
+dotnet run -c Release -- --config .\config.json
+```
+
+啟動後應看到類似訊息：
+
+```text
+[啟動] 監聽 port 4499
+[啟動] 監聽 port 4500
+[啟動] 監聽 port 4501
+```
+
+### B. 確認服務正在監聽
+
+在另一個 PowerShell 視窗執行：
+
+```powershell
+Get-NetTCPConnection -LocalPort 4499,4500,4501 -State Listen
+```
+
+或使用本機 TCP 測試：
+
+```powershell
+Test-NetConnection -ComputerName <AUTHORIZED_HOST> -Port 4499
+```
+
+### C. 使用 Windows Remote Desktop Client 測試
+
+```powershell
+mstsc /v:<AUTHORIZED_HOST>:4499
+```
+
+若出現自簽憑證警告，測試環境中可確認目標名稱後繼續。輸入測試帳號與測試密碼後，服務會：
+
+1. 完成可支援的 X.224 / TLS / MCS 階段
+2. 解析 Info PDU 中的 username、password、domain
+3. 在 console 顯示擷取事件
+4. 將事件寫入 `captured_creds.jsonl`
+5. 依 `profile.disconnectMode` 結束本 honeypot 連線
+
+### D. 查看擷取結果
+
+查看最後一筆 JSONL 事件：
+
+```powershell
+Get-Content .\captured_creds.jsonl | Select-Object -Last 1
+```
+
+查看所有標準/TLS 事件：
+
+```powershell
+Get-Content .\captured_creds.jsonl
+```
+
+查看最新 Session 目錄：
+
+```powershell
+$latest = Get-ChildItem .\session_* -Directory |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+
+Get-Content "$($latest.FullName)\session.log"
+Get-Content "$($latest.FullName)\credential.json"
+```
+
+若測試的是 NLA/NTLM 路徑，另查看：
+
+```powershell
+Get-Content .\nla_accounts.jsonl
+```
+
+> `captured_creds.jsonl` 與 `nla_accounts.jsonl` 可能包含敏感憑證，僅限授權人員讀取。測試完成後請依組織政策清除或加密保存。
+
+### E. 啟用原始封包分析
+
+預設不寫 `raw.bin`。需要分析協定時，在 `config.json` 改成：
+
+```json
+"enableRawCapture": true
+```
+
+重新啟動服務後，每個深度 Session 會產生：
+
+```text
+session_XXXXXX\raw.bin
+```
+
+原始封包可能包含帳號、密碼或其他敏感資料，分析完成後應關閉此選項並清理檔案：
+
+```json
+"enableRawCapture": false
+```
+
+### F. RDP Scanner 授權驗證
+
+只掃描自己管理的目標：
+
+```powershell
+nmap -Pn -p 4499 --script rdp-enum-encryption <AUTHORIZED_HOST>
+```
+
+可檢查：
+
+- TCP port 是否 reachable/open
+- X.224 negotiation 是否有回應
+- TLS 憑證是否可取得
+- RDP security protocol 是否可辨識
+
+Scanner 判定為 RDP 服務，不代表本專案提供完整 Windows 桌面；本工具只完成足以進行安全研究與登入嘗試記錄的協定階段。
+
+### G. 連線結束模式
+
+`config.json` 中的 `profile` 可設定：
+
+```json
+"disconnectMode": "capture_and_close",
+"disconnectDelayMs": 0
+```
+
+可用模式：
+
+- `capture_and_close`：擷取後立即關閉本 honeypot 連線
+- `capture_and_graceful_close`：擷取後等待指定毫秒，再正常關閉
+- `shutdown_like`：模擬完成回應後延遲關閉的時序
+
+`shutdown_like` 不會向其他主機傳送封包，也不能保證 mstsc 顯示固定的「遠端電腦正在關機」文字；Windows 客戶端的錯誤視窗由 mstsc 根據協定狀態自行決定。
+
+---
+
 ## 設定檔格式（JSON）
 
 `config.json`：
@@ -110,7 +275,23 @@ RdpHoneypot.exe --port 4499,4500,4501 --output D:\honeypot-logs
   "idleTimeoutSeconds": 20,
   "eventQueueCapacity": 100000,
   "enableRawCapture": false,
-  "logDir": null
+  "logDir": null,
+  "profile": {
+    "computerName": "WIN-SRV01",
+    "domainName": "WORKGROUP",
+    "enableTls": true,
+    "enableNla": true,
+    "enableStandardSecurity": true,
+    "enableHybridEx": false,
+    "certificateSubject": "CN=WIN-SRV01",
+    "persistCertificate": true,
+    "certificateLifetimeDays": 365,
+    "certificateRenewalDays": 30,
+    "responseDelayMinMs": 20,
+    "responseDelayMaxMs": 120,
+    "disconnectMode": "capture_and_close",
+    "disconnectDelayMs": 0
+  }
 }
 ```
 
@@ -130,10 +311,40 @@ RdpHoneypot.exe --port 4499,4500,4501 --output D:\honeypot-logs
 | `eventQueueCapacity` | 整數 | `100000` | 事件佇列容量（預留 Wave 2 使用） |
 | `enableRawCapture` | 布林 | `false` | 是否記錄原始封包（預設關閉，避免磁碟反壓） |
 | `logDir` | 字串或 null | `null` | 記錄輸出目錄（null = exe 所在目錄） |
+| `profile` | 物件 | 見下表 | 服務指紋、協定選擇、憑證與時序設定 |
+
+### profile 欄位
+
+| 欄位 | 型別 | 預設值 | 說明 |
+|------|------|--------|------|
+| `computerName` | 字串 | `WIN-SRV01` | 模擬的電腦名稱，亦用於預設憑證 CN/SAN |
+| `domainName` | 字串 | `WORKGROUP` | 模擬網域名稱（目前主要供 profile/遙測使用） |
+| `enableTls` | 布林 | `true` | 是否接受 TLS/SSL 協商 |
+| `enableNla` | 布林 | `true` | 是否接受 HYBRID/NLA 協商 |
+| `enableStandardSecurity` | 布林 | `true` | 是否接受未帶 RDP_NEG_REQ 的 legacy 模式 |
+| `enableHybridEx` | 布林 | `false` | 是否宣告/接受 Hybrid-Ex；預設不冒充未實作能力 |
+| `certificateSubject` | 字串/null | `CN=WIN-SRV01` | TLS 自簽憑證 Subject |
+| `persistCertificate` | 布林 | `true` | 是否將 TLS 憑證保存為 exe 同層 `tls-server.pfx` |
+| `certificateLifetimeDays` | 整數 | `365` | 新憑證有效期 |
+| `certificateRenewalDays` | 整數 | `30` | 距離到期少於此天數時重新建立 |
+| `responseDelayMinMs` | 整數 | `20` | MCS 回應前 jitter 下限（0~2000） |
+| `responseDelayMaxMs` | 整數 | `120` | MCS 回應前 jitter 上限（0~2000） |
+| `disconnectMode` | 字串 | `capture_and_close` | 擷取後的本 honeypot 連線結束模式 |
+| `disconnectDelayMs` | 整數 | `0` | 結束前延遲（0~10000ms） |
+
+`disconnectMode` 可用值：
+
+| 模式 | 行為 |
+|------|------|
+| `capture_and_close` | 完成擷取後立即關閉本 honeypot 連線（預設） |
+| `capture_and_graceful_close` | 完成擷取後延遲，再正常關閉本 honeypot 連線 |
+| `shutdown_like` | 模擬「完成回應後延遲再關閉」的時序；不保證 mstsc 顯示固定的「遠端電腦正在關機」文字 |
 
 > **注意**：JSON 中 Windows 絕對路徑的反斜線必須跳脫（`"D:\\logs"`）或改用正斜線（`"D:/logs"`）。
 
 > **資源降級行為**：當 `maxConcurrentSessions`、`maxConcurrentPerIp` 或 `maxConcurrentPerSubnet` 任一達上限時，新連線仍會收到 X.224 Connection Confirm（掃描器看到 RDP 服務），但不會繼續 TLS/MCS/Info PDU 處理，也不會建立 session 目錄或寫入任何檔案。
+>
+> **Wave 5 憑證注意事項**：`persistCertificate=true` 時會在 exe 同層產生 `tls-server.pfx`。此檔案包含私鑰，已加入 `.gitignore`，請限制檔案權限，不要上傳或複製到公開位置。刪除憑證後重啟會產生新的服務指紋。
 
 ---
 
@@ -271,7 +482,9 @@ RdpHoneypot.exe --port 4499,4500,4501 --output D:\honeypot-logs
 
 2. **Windows Schannel 相容性**：.NET 產生的記憶體金鑰無法直接被 Schannel 存取，導致 `platform does not support ephemeral keys` 錯誤。解法是將自簽憑證匯出為 PFX 後，以 `X509KeyStorageFlags.PersistKeySet` 重新載入，註冊到 Windows 金鑰存放區。
 
-2. **RDP 協商位元**：`RDP_NEG_REQ.requestedProtocols` 的位元定義為 `0x01=Standard`、`0x02=TLS`、`0x04=NLA (HYBRID)`。選擇協定時依此正確對應，避免把 TLS 誤判為 NLA。
+3. **RDP 協商位元**：`RDP_NEG_REQ.requestedProtocols` 使用 `0x01=SSL/TLS`、`0x02=HYBRID/NLA`、`0x04=RDSTLS`、`0x08=HYBRID_EX`。本專案只在 profile 宣告且實際處理的能力上回應；未支援的 Hybrid-Ex 不會被誤判為普通 NLA。
+
+4. **持久化服務指紋**：`RdpServerProfile` 控制 computer name、協定組合、憑證 Subject/SAN 與有限 jitter。TLS PFX 預設保存於 exe 同層並被 `.gitignore` 排除，不會進入版本控制。
 
 3. **MCS 完整握手**：除 Connect Initial/Response 外，還需處理 **Erect Domain Request → Attach User Request → Channel Join Request** 等階段，client 才會送出含憑證的 Info PDU。
 

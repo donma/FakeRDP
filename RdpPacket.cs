@@ -55,6 +55,26 @@ static class RdpPacket
     }
 
     /// <summary>
+    /// 建構 X.224 Connection Confirm with RDP_NEG_FAILURE。
+    /// </summary>
+    public static byte[] BuildX224ConnectionFailure(uint failureCode)
+    {
+        return
+        [
+            0x03, 0x00, 0x00, 0x13,
+            0x0E, 0xD0,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00,
+            0x03, 0x00, 0x08, 0x00,
+            (byte)(failureCode & 0xFF),
+            (byte)((failureCode >> 8) & 0xFF),
+            (byte)((failureCode >> 16) & 0xFF),
+            (byte)((failureCode >> 24) & 0xFF)
+        ];
+    }
+
+    /// <summary>
     /// 嘗試從 X.224 Connection Request 中解析 RDP_NEG_REQ
     /// 回傳 client 要求協商的協定 bitmask (0 = 無協商要求)
     /// RDP_NEG_REQ 位於 X.224 CR 的**最後 8 bytes**
@@ -74,8 +94,10 @@ static class RdpPacket
             packet[offset + 2] == 0x08 && packet[offset + 3] == 0x00)
         {
             uint protocols = BitConverter.ToUInt32(packet, offset + 4);
-            // 驗證至少包含已知協定位元 (TLS=0x01, CredSSP=0x02)
-            if ((protocols & 0x03) != 0)
+            // 已知協定位元：SSL/TLS=0x01、HYBRID/NLA=0x02、
+            // RDSTLS=0x04、HYBRID_EX=0x08。
+            // 本蜜罐只會選擇實際支援的 SSL/HYBRID，其他位元保留給選擇器判斷。
+            if ((protocols & 0x0F) != 0)
                 return protocols;
         }
         return 0;

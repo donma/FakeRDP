@@ -71,7 +71,17 @@ static class Program
                             "mcsTimeoutSeconds": 5,
                             "credSspTimeoutSeconds": 10,
                             "idleTimeoutSeconds": 20,
-                            "enableRawCapture": false
+                            "enableRawCapture": false,
+                            "profile": {
+                              "computerName": "WIN-SRV01",
+                              "domainName": "WORKGROUP",
+                              "enableTls": true,
+                              "enableNla": true,
+                              "enableStandardSecurity": true,
+                              "persistCertificate": true,
+                              "responseDelayMinMs": 20,
+                              "responseDelayMaxMs": 120
+                            }
                           }
                         參數:
                           --config  設定檔路徑 (預設 ./config.json)
@@ -145,6 +155,18 @@ static class Program
             Console.Error.WriteLine("[錯誤] maxPacketBytes 需在 512 ~ 8MB 之間");
             return 1;
         }
+
+        var profile = options.Profile ?? new RdpServerProfile();
+        if (string.IsNullOrWhiteSpace(profile.ComputerName) || profile.ComputerName.Length > 63)
+        {
+            Console.Error.WriteLine("[錯誤] profile.computerName 必須是 1~63 字元");
+            return 1;
+        }
+        profile.ResponseDelayMinMs = Math.Clamp(profile.ResponseDelayMinMs, 0, 2000);
+        profile.ResponseDelayMaxMs = Math.Clamp(profile.ResponseDelayMaxMs, profile.ResponseDelayMinMs, 2000);
+        profile.CertificateLifetimeDays = Math.Clamp(profile.CertificateLifetimeDays, 1, 3650);
+        profile.CertificateRenewalDays = Math.Clamp(profile.CertificateRenewalDays, 0, profile.CertificateLifetimeDays);
+        options.Profile = profile;
 
         try
         {
