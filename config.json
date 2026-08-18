@@ -21,6 +21,7 @@
     "enableStandardSecurity": true,
     "enableHybridEx": false,
     "certificateSubject": "CN=WIN-SRV01",
+    "certificatePath": "certs/test-rdp.pfx",
     "persistCertificate": true,
     "certificateLifetimeDays": 365,
     "certificateRenewalDays": 30,

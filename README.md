@@ -284,6 +284,7 @@ Scanner 判定為 RDP 服務，不代表本專案提供完整 Windows 桌面；�
     "enableStandardSecurity": true,
     "enableHybridEx": false,
     "certificateSubject": "CN=WIN-SRV01",
+    "certificatePath": "certs/test-rdp.pfx",
     "persistCertificate": true,
     "certificateLifetimeDays": 365,
     "certificateRenewalDays": 30,
@@ -324,7 +325,10 @@ Scanner 判定為 RDP 服務，不代表本專案提供完整 Windows 桌面；�
 | `enableStandardSecurity` | 布林 | `true` | 是否接受未帶 RDP_NEG_REQ 的 legacy 模式 |
 | `enableHybridEx` | 布林 | `false` | 是否宣告/接受 Hybrid-Ex；預設不冒充未實作能力 |
 | `certificateSubject` | 字串/null | `CN=WIN-SRV01` | TLS 自簽憑證 Subject |
-| `persistCertificate` | 布林 | `true` | 是否將 TLS 憑證保存為 exe 同層 `tls-server.pfx` |
+| `certificatePath` | 字串/null | `certs/test-rdp.pfx` | PFX 路徑；相對路徑以啟動目錄為基準 |
+| `persistCertificate` | 布林 | `true` | 是否保存/重用 TLS PFX |
+
+> `certs/test-rdp.pfx` 是刻意提交的公開測試憑證，包含測試私鑰，只能在隔離測試環境使用。正式或客戶環境請改用部署專用憑證，並將其加入 `.gitignore`。
 | `certificateLifetimeDays` | 整數 | `365` | 新憑證有效期 |
 | `certificateRenewalDays` | 整數 | `30` | 距離到期少於此天數時重新建立 |
 | `responseDelayMinMs` | 整數 | `20` | MCS 回應前 jitter 下限（0~2000） |
@@ -344,7 +348,7 @@ Scanner 判定為 RDP 服務，不代表本專案提供完整 Windows 桌面；�
 
 > **資源降級行為**：當 `maxConcurrentSessions`、`maxConcurrentPerIp` 或 `maxConcurrentPerSubnet` 任一達上限時，新連線仍會收到 X.224 Connection Confirm（掃描器看到 RDP 服務），但不會繼續 TLS/MCS/Info PDU 處理，也不會建立 session 目錄或寫入任何檔案。
 >
-> **Wave 5 憑證注意事項**：`persistCertificate=true` 時會在 exe 同層產生 `tls-server.pfx`。此檔案包含私鑰，已加入 `.gitignore`，請限制檔案權限，不要上傳或複製到公開位置。刪除憑證後重啟會產生新的服務指紋。
+> **測試憑證注意事項**：`certs/test-rdp.pfx` 是刻意放入 repository 的公開測試憑證，包含私鑰，只能用於隔離測試；任何人都可以使用它冒充測試服務。正式環境請刪除它、改用自己的憑證並把 PFX 排除在版本控制之外。
 
 ---
 
@@ -355,6 +359,7 @@ Scanner 判定為 RDP 服務，不代表本專案提供完整 Windows 桌面；�
 ├── honeypot.log                  # 啟動/停止紀錄
 ├── captured_creds.jsonl          # 所有成功擷取的憑證（JSONL，每行一筆）
 ├── nla_accounts.jsonl            # NLA 路徑擷取的帳號（含網域與 IP）
+├── certs\test-rdp.pfx             # 公開測試 PFX（包含測試私鑰）
 └── session_000001/               # 僅深度連線建立（lazy）
     ├── session.log               # 該連線的協定階段文字紀錄
     ├── raw.bin                   # 原始封包資料（僅 enableRawCapture=true）

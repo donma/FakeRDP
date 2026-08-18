@@ -6,4 +6,7 @@
     <Nullable>enable</Nullable>
     <RootNamespace>RdpHoneypot</RootNamespace>
   </PropertyGroup>
+  <ItemGroup>
+    <None Update="certs\test-rdp.pfx" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>

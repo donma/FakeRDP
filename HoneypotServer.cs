@@ -36,7 +36,7 @@ sealed class HoneypotServer
             ? $"CN={profile.ComputerName}"
             : profile.CertificateSubject;
         var certificatePath = profile.PersistCertificate
-            ? Path.Combine(_logDir, "tls-server.pfx")
+            ? ResolveCertificatePath(profile.CertificatePath)
             : null;
         _tlsCert = CryptoHelper.CreateRsaCertForTls(
             subject,
@@ -47,6 +47,15 @@ sealed class HoneypotServer
             profile.PersistCertificate);
         _tlsRsaKey = _tlsCert.GetRSAPrivateKey()!;
         _serverRandom = CryptoHelper.GenerateRandom(32);
+    }
+
+    string? ResolveCertificatePath(string? configuredPath)
+    {
+        if (string.IsNullOrWhiteSpace(configuredPath))
+            return Path.Combine(_logDir, "tls-server.pfx");
+        return Path.IsPathFullyQualified(configuredPath)
+            ? configuredPath
+            : Path.GetFullPath(configuredPath, Environment.CurrentDirectory);
     }
 
     public async Task RunAsync(CancellationToken ct = default)

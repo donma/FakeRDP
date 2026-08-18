@@ -16,6 +16,8 @@ sealed class RdpServerProfile
 
     /// <summary>省略時使用 CN={ComputerName}。</summary>
     public string? CertificateSubject { get; set; }
+    /// <summary>相對路徑以啟動程式的工作目錄為基準。</summary>
+    public string? CertificatePath { get; set; } = "certs/test-rdp.pfx";
     public bool PersistCertificate { get; set; } = true;
     public int CertificateLifetimeDays { get; set; } = 365;
     public int CertificateRenewalDays { get; set; } = 30;

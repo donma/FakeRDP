@@ -202,6 +202,7 @@ Current `config.json` example:
     "enableStandardSecurity": true,
     "enableHybridEx": false,
     "certificateSubject": "CN=WIN-SRV01",
+    "certificatePath": "certs/test-rdp.pfx",
     "persistCertificate": true,
     "certificateLifetimeDays": 365,
     "certificateRenewalDays": 30,
@@ -243,7 +244,8 @@ Current `config.json` example:
 | `enableStandardSecurity` | `true` | Accept legacy requests without RDP negotiation. |
 | `enableHybridEx` | `false` | Reserved for future Hybrid-Ex support; disabled by default. |
 | `certificateSubject` | `CN=WIN-SRV01` | TLS certificate subject. |
-| `persistCertificate` | `true` | Reuse `tls-server.pfx` beside the executable. |
+| `certificatePath` | `certs/test-rdp.pfx` | PFX path; relative paths are resolved from the launch directory. |
+| `persistCertificate` | `true` | Save or reuse the TLS PFX. |
 | `certificateLifetimeDays` | `365` | Lifetime for a newly generated certificate. |
 | `certificateRenewalDays` | `30` | Regenerate when the certificate is close to expiry. |
 | `responseDelayMinMs` | `20` | Lower response jitter bound. |
@@ -270,7 +272,7 @@ bin\Release\net10.0\
 ├── honeypot.log
 ├── captured_creds.jsonl
 ├── nla_accounts.jsonl
-├── tls-server.pfx
+├── certs\test-rdp.pfx         # public test PFX; contains a test private key
 └── session_000001\
     ├── session.log
     ├── credential.json
@@ -313,7 +315,8 @@ An NTLM Type 3 message proves that a client sent an authentication attempt. It d
 
 - Restrict access to `captured_creds.jsonl`, `nla_accounts.jsonl`, session directories, and `raw.bin`.
 - Do not commit these files to Git.
-- Do not upload `tls-server.pfx` to a public repository; it contains a private key.
+- `certs/test-rdp.pfx` is intentionally included as a public test certificate and contains a private key. Anyone can use it to impersonate the test service; use it only in an isolated lab.
+- For production or customer deployments, delete the test PFX, configure a deployment-specific certificate, and add that PFX to `.gitignore`.
 - Disable raw capture after protocol analysis.
 - Delete or encrypt test records according to the customer’s retention policy.
 
