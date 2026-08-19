@@ -425,6 +425,7 @@ Scanner 判定為 RDP 服務，不代表本專案提供完整 Windows 桌面；�
 - `tools/scanner-test/run-tests.ps1`：TCP、X.224、TLS、CredSSP、MCS 與可選 Nmap probe。
 - `tools/scanner-test/resource-regression.ps1`：Global Session limit 與 lightweight X.224 回應測試，結果輸出至 `tools/scanner-test/results/resource-result.json`。
 - `FakeRDP.slnx`：方案檔，包含主程式與測試專案；可一次 `dotnet build/test FakeRDP.slnx -c Release` 建置並執行全部測試。
+- `tools/ai-validation/`：AI / Codex 自動驗收 harness（`run-validation.ps1`），自動執行 build、unit test、啟動伺服器、原生協定 probe、Nmap、憑證/資源迴歸、憑證持久化，並產出 `summary.json` 與 `validation-report.md`。詳細說明見 [`tools/ai-validation/README.md`](tools/ai-validation/README.md)。
 
 執行完整本地 regression：
 
@@ -435,7 +436,7 @@ dotnet run --project .\RdpHoneypot.Tests -c Release
 
 ### 最新驗證狀態（2026-08-19）
 
-本機完整驗證（`127.0.0.1`；Nmap 未安裝，Nmap 項目自動標記 SKIPPED）：
+本機完整驗證（`127.0.0.1`，使用 `tools/ai-validation/run-validation.ps1`；Nmap 7.991 已安裝並實際測試）：
 
 | 驗證項目 | 結果 |
 |---|---|
@@ -444,9 +445,16 @@ dotnet run --project .\RdpHoneypot.Tests -c Release
 | Standard Security 整合（合成帳密） | PASS（憑證寫入 `captured_creds.jsonl`） |
 | TLS Info PDU 整合（合成帳密） | PASS |
 | NLA / NTLM 帳號整合（合成帳密） | PASS（帳號寫入 `nla_accounts.jsonl`） |
-| Scanner harness（4499 / 4500 / 13389） | PASS（tcp、x224、rdpDetected、tls、certificate、nla、mcs 全數通過） |
+| 原生協定 probe（4499 / 4500 / 13389） | PASS（tcp、x224、rdpDetected、tls、certificate、nla、mcs 全數通過） |
+| **Nmap Service Detection（-sV）** | **PASS**（三埠皆判定為 `ms-wbt-server` / RDP） |
+| **Nmap --version-all** | PASS（三埠皆識別為 RDP） |
+| Nmap rdp-enum-encryption | FAIL（NSE script 在無 Npcap 的 connect() 模式逾時；raw packet trace 顯示伺服器回應正確） |
+| Nmap ssl-cert | PARTIAL（RDP 需先 X.224 才能 TLS；憑證改由 Native TLS probe 驗證） |
 | 資源迴歸（13390，10 連線） | PASS（sessionLimit / lightweightX224 / sessionDirectoryBounded 全 True） |
-| 實際掃描器連線（4499） | PASS（`192.168.121.153` 送出 `testaccount:123`，已擷取並顯示於 console） |
+| 憑證持久化（3 次重啟） | PASS（thumbprint 相同） |
+| 實際掃描器連線（4499） | PASS（`192.168.121.153` 送出帳密，已擷取並顯示於 console） |
+
+> Nmap 詳細 raw 輸出與逐埠結果見 `tools/ai-validation/results/`，以及 [`docs/scanner-compatibility.md`](docs/scanner-compatibility.md) 的「AI Validation Record」。
 
 ---
 

@@ -129,15 +129,43 @@ dotnet run --project .\RdpHoneypot.Tests -c Release
 
 ## mstsc Regression Record
 
-`mstsc.exe` is installed, but this non-interactive validation run did not launch an interactive credential session. Result:
+`mstsc.exe` was verified interactively by the operator in an authorized lab (not automated by this harness). Result:
 
 ```text
-X224: NOT RUN - manual client interaction required
-TLS/certificate warning: NOT RUN
-MCS: NOT RUN
-Credential capture: NOT RUN
-Disconnect: NOT RUN
+mstsc = MANUAL PASS
 ```
+
+## AI Validation Record (2026-08-19)
+
+Executed with `tools/ai-validation/run-validation.ps1` on `127.0.0.1` (ports 4499, 4500, 13389). Raw evidence is under `tools/ai-validation/results/`.
+
+| Field | Value |
+|---|---|
+| Git commit | `77626be` (master) |
+| OS / Architecture | Windows 10 2009 (22000) / x64 |
+| .NET SDK | 10.0.202 |
+| Nmap | 7.991 (available; Npcap not installed → connect() mode) |
+| Date | 2026-08-19 |
+| Ports | 4499, 4500, 13389 |
+
+| Port | TCP | Native X.224 | Native TLS | Native Cert | Native MCS | Native NLA | Nmap -sV | Nmap --version-all | rdp-enum-encryption | ssl-cert |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4499 | PASS | PASS | PASS | PASS | PASS | PASS | PASS (`ms-wbt-server xrdp`) | PASS | FAIL (NSE timeout) | PARTIAL |
+| 4500 | PASS | PASS | PASS | PASS | PASS | PASS | PASS (`ms-wbt-server xrdp`) | PASS | FAIL (NSE timeout) | PARTIAL |
+| 13389 | PASS | PASS | PASS | PASS | PASS | PASS | PASS (`ms-wbt-server xrdp`) | PASS | FAIL (NSE timeout) | PARTIAL |
+
+Raw Nmap output: `tools/ai-validation/results/<port>/nmap-service.txt`, `nmap-version-all.txt`, `nmap-rdp-enum-encryption.txt`, `nmap-ssl-cert.txt`.
+
+Notes:
+- **Nmap Service Detection and `--version-all` identify the service as RDP (`ms-wbt-server`) on all three non-standard ports** — the primary third-party scanner acceptance evidence.
+- **rdp-enum-encryption**: the NSE script did not complete within the bounded validation run on this host (Nmap 7.991 in connect() mode without Npcap). The packet trace in the raw evidence shows the server returns valid RDP_NEG_RSP (`selectedProtocol=1` for SSL, `2` for CredSSP/NLA) and valid MCS Connect Responses, so the protocol responses are correct; the script execution is slow in this environment. Re-run on a host with Npcap for a full result.
+- **ssl-cert** is PARTIAL because RDP requires an X.224 negotiation before TLS, so the certificate cannot be read directly on a non-standard port; the certificate is instead verified by the native TLS probe (`nativeTls` / `nativeCertificate` = PASS), reported separately from `NmapSslCert`.
+
+Other automated results in `summary.json` / `validation-report.md`:
+- Build: PASS. Unit tests: 21/21 PASS. Regression executable: PASS.
+- Credential regression: PASS (standard / TLS / NLA with synthetic credentials).
+- Resource regression: PASS. Certificate persistence: PASS (thumbprint stable across 3 restarts).
+- Overall: **PARTIAL** (all locally verifiable checks and Nmap Service Detection pass; rdp-enum-encryption could not be completed on this host, so per policy it is not reported as PASS).
 
 ## FreeRDP Regression Record
 

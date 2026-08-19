@@ -337,6 +337,7 @@ This enhancement adds:
 - `tools/scanner-test/run-tests.ps1`: TCP, X.224, TLS, CredSSP, MCS, and optional Nmap probes.
 - `tools/scanner-test/resource-regression.ps1`: global session-limit and lightweight X.224 response test; writes JSON results to `tools/scanner-test/results/resource-result.json`.
 - `FakeRDP.slnx`: solution file including the main project and test project; `dotnet build/test FakeRDP.slnx -c Release` builds and runs everything at once.
+- `tools/ai-validation/`: an AI / Codex automated acceptance harness (`run-validation.ps1`) that runs build, unit tests, server startup, native protocol probes, Nmap, credential/resource regression, and certificate persistence, then writes `summary.json` and `validation-report.md`. See [`tools/ai-validation/README.md`](tools/ai-validation/README.md).
 
 Run the local regression suite:
 
@@ -347,7 +348,7 @@ dotnet run --project .\RdpHoneypot.Tests -c Release
 
 ### Latest Validation Status (2026-08-19)
 
-Local validation on `127.0.0.1` (Nmap is not installed, so Nmap checks are marked SKIPPED):
+Local validation on `127.0.0.1` via `tools/ai-validation/run-validation.ps1` (Nmap 7.991 installed and executed):
 
 | Check | Result |
 |---|---|
@@ -356,9 +357,16 @@ Local validation on `127.0.0.1` (Nmap is not installed, so Nmap checks are marke
 | Standard Security integration (synthetic credentials) | PASS (credential written to `captured_creds.jsonl`) |
 | TLS Info PDU integration (synthetic credentials) | PASS |
 | NLA / NTLM account integration (synthetic credentials) | PASS (account written to `nla_accounts.jsonl`) |
-| Scanner harness (4499 / 4500 / 13389) | PASS (tcp, x224, rdpDetected, tls, certificate, nla, mcs all true) |
+| Native protocol probe (4499 / 4500 / 13389) | PASS (tcp, x224, rdpDetected, tls, certificate, nla, mcs all true) |
+| **Nmap Service Detection (-sV)** | **PASS** (`ms-wbt-server` / RDP on all three ports) |
+| **Nmap --version-all** | PASS (identified as RDP on all three ports) |
+| Nmap rdp-enum-encryption | FAIL (NSE script timed out in Npcap-less connect() mode; the packet trace shows the server responds correctly) |
+| Nmap ssl-cert | PARTIAL (RDP requires X.224 before TLS; the certificate is verified by the native TLS probe instead) |
 | Resource regression (13390, 10 probes) | PASS (sessionLimit / lightweightX224 / sessionDirectoryBounded all true) |
-| Live scanner capture (4499) | PASS (`192.168.121.153` sent `testaccount:123`, captured and shown in the console) |
+| Certificate persistence (3 restarts) | PASS (identical thumbprint) |
+| Live scanner capture (4499) | PASS (`192.168.121.153` sent credentials, captured and shown in the console) |
+
+> Per-port Nmap raw output and results are under `tools/ai-validation/results/`; see the "AI Validation Record" section of [`docs/scanner-compatibility.md`](docs/scanner-compatibility.md).
 
 ---
 

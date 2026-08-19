@@ -4,6 +4,10 @@ logs/
 server.stdout.log
 server.stderr.log
 tools/scanner-test/results/
+tools/ai-validation/results/
+tools/ai-validation/runtime-config.json
+tools/ai-validation/runtime-resource-config.json
+tools/ai-validation/runtime-cert-config.json
 tls-server.pfx
 *.user
 *.suo
