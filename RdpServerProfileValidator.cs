@@ -26,9 +26,11 @@ static class RdpServerProfileValidator
             errors.Add("profile.responseDelayMinMs/maxMs must be ordered and within 0-2000 ms.");
         if (profile.DisconnectDelayMs is < 0 or > 10000)
             errors.Add("profile.disconnectDelayMs must be between 0 and 10000 ms.");
-        if (!string.IsNullOrWhiteSpace(profile.CertificateSubject))
+        if (profile.CertificateSubject is not null)
         {
-            if (!profile.CertificateSubject.Contains("CN=", StringComparison.OrdinalIgnoreCase))
+            if (string.IsNullOrWhiteSpace(profile.CertificateSubject))
+                errors.Add("profile.certificateSubject cannot be empty when specified.");
+            else if (!profile.CertificateSubject.Contains("CN=", StringComparison.OrdinalIgnoreCase))
                 errors.Add("profile.certificateSubject must contain a CN when specified.");
             else
             {
@@ -36,6 +38,16 @@ static class RdpServerProfileValidator
                 var cn = profile.CertificateSubject[cnStart..].Split(',', 2)[0].Trim();
                 if (!cn.Equals(profile.ComputerName, StringComparison.OrdinalIgnoreCase))
                     errors.Add("profile.certificateSubject CN must match profile.computerName.");
+            }
+        }
+        if (profile.CertificatePath is not null)
+        {
+            if (string.IsNullOrWhiteSpace(profile.CertificatePath))
+                errors.Add("profile.certificatePath cannot be empty when specified.");
+            else
+            {
+                try { _ = Path.GetFullPath(profile.CertificatePath); }
+                catch (Exception) { errors.Add("profile.certificatePath is not a valid path."); }
             }
         }
         return errors;

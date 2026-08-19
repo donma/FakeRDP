@@ -25,12 +25,12 @@ static class CryptoHelper
     /// 產生 RSA 2048-bit 金鑰並建立自簽憑證
     /// 用於 RDP 標準安全交換 (RSA 加密 client random)
     /// </summary>
-    public static (RSA key, X509Certificate2 cert) CreateRsaCert()
+    public static (RSA key, X509Certificate2 cert) CreateRsaCert(string subject = "CN=RDP-Server")
     {
         var rsa = RSA.Create(2048);
 
         var req = new CertificateRequest(
-            "CN=RDP-Server",
+            subject,
             rsa,
             HashAlgorithmName.SHA256,
             RSASignaturePadding.Pkcs1);

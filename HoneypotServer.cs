@@ -30,11 +30,11 @@ sealed class HoneypotServer
         _logDir = options.LogDir ?? AppContext.BaseDirectory;
         Directory.CreateDirectory(_logDir);
 
-        (_rsaKey, _serverCert) = CryptoHelper.CreateRsaCert();
         var profile = options.Profile ?? new RdpServerProfile();
         var subject = string.IsNullOrWhiteSpace(profile.CertificateSubject)
             ? $"CN={profile.ComputerName}"
             : profile.CertificateSubject;
+        (_rsaKey, _serverCert) = CryptoHelper.CreateRsaCert(subject);
         var certificatePath = profile.PersistCertificate
             ? ResolveCertificatePath(profile.CertificatePath)
             : null;
@@ -113,6 +113,19 @@ sealed class HoneypotServer
         foreach (var l in listeners) l.Stop();
     }
 
+    ConsoleLogLevel ConsoleLevel
+        => Enum.TryParse<ConsoleLogLevel>(_options.ConsoleLogLevel, true, out var level)
+            ? level
+            : ConsoleLogLevel.Credential;
+
+    bool IsConsoleLevelEnabled(ConsoleLogLevel level) => ConsoleLevel >= level;
+
+    void ConsoleLog(ConsoleLogLevel level, string line)
+    {
+        if (IsConsoleLevelEnabled(level))
+            Console.WriteLine(line);
+    }
+
     async Task AcceptLoopAsync(TcpListener listener, SessionLimiter limiter,
         IpConnectionTracker tracker, EventRecorder recorder, CancellationToken ct)
     {
@@ -127,7 +140,8 @@ sealed class HoneypotServer
 
                 var id = Interlocked.Increment(ref _sessionCounter);
                 var ep = (IPEndPoint)client.Client.RemoteEndPoint!;
-                Console.WriteLine($"[{id}] + Connection from {ep} -> port {localPort}");
+                if (IsConsoleLevelEnabled(ConsoleLogLevel.Connection))
+                    Console.WriteLine($"[{id}] + Connection from {ep} -> port {localPort}");
 
                 var session = new RdpSession(id, ep, localPort, client,
                     _options, _logDir,
@@ -139,7 +153,8 @@ sealed class HoneypotServer
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
-                Console.WriteLine($"[!] Accept error (port {localPort}): {ex.Message}");
+                ConsoleLog(ConsoleLogLevel.Error,
+                    $"[!] Accept error (port {localPort}): {ex.Message}");
             }
         }
     }

@@ -73,6 +73,7 @@ static class Program
                             "idleTimeoutSeconds": 20,
                             "enableRawCapture": false,
                             "consoleCredentialMode": "masked",
+                            "consoleLogLevel": "Credential",
                             "profile": {
                               "computerName": "WIN-SRV01",
                               "domainName": "WORKGROUP",
@@ -178,6 +179,11 @@ static class Program
             !string.Equals(options.ConsoleCredentialMode, "full", StringComparison.OrdinalIgnoreCase))
         {
             Console.Error.WriteLine("[設定錯誤] consoleCredentialMode 必須是 masked 或 full");
+            return 1;
+        }
+        if (!Enum.TryParse<ConsoleLogLevel>(options.ConsoleLogLevel, true, out _))
+        {
+            Console.Error.WriteLine("[設定錯誤] consoleLogLevel 必須是 None、Error、Credential、Connection、Protocol 或 Debug");
             return 1;
         }
 

@@ -18,10 +18,12 @@
   - **NLA/CredSSP（部分）**：處理 NTLM Type 1/2/3，擷取 **帳號與網域**（密碼需 TSCredentials，現代 mstsc 因 SPNEGO mechListMIC 通常拒絕後續交換）
 - **完整擷取資訊**：來源 IP、來源連接埠、目標連接埠、帳號、密碼、網域、Cookie、時間戳
 - **Console 即時顯示**：成功擷取憑證時以紅字即時顯示來源 IP、來源 Port、目標 Port、帳號、網域與密碼；程式預設為遮罩，授權測試可設定 `consoleCredentialMode=full`
+- **Console log level**：以 `consoleLogLevel` 控制高頻 console 輸出；可用 `None`、`Error`、`Credential`、`Connection`、`Protocol`、`Debug`，session log 仍保留完整協定紀錄
 - **協定遙測**：Session log 記錄 requested/selected protocol、Cookie/mstshash、TLS protocol/cipher suite、certificate thumbprint 與 state transition
 - **Profile 一致性驗證**：啟動時拒絕 NLA 無 TLS、未實作 Hybrid-Ex、未實作 RDSTLS、無效憑證參數或身份不一致設定
 - **Scanner compatibility harness**：提供 X.224、TLS、CredSSP challenge、MCS、多 Port 與資源限制的 PowerShell 測試工具
-- **自動回歸測試**：新增 `RdpHoneypot.Tests`，涵蓋協定選擇、RDP_NEG_FAILURE、憑證持久化、MCS builder、credential parser 與資源限制
+- **自動回歸測試**：`RdpHoneypot.Tests` 涵蓋協定選擇、RDP_NEG_FAILURE、憑證持久化、MCS builder、credential parser 與資源限制（21/21 測試通過）
+- **合成憑證整合測試**：`--integration --mode standard|tls|nla` 以合成帳密驗證 Standard Security、TLS Info PDU 與 NLA/NTLM 三條憑證擷取路徑
 - **雙檔記錄**：JSONL 匯總檔 + 每 session 獨立目錄（文字日誌 + 原始封包）
 - **資源保護（高併發防耗盡）**：
   - 全域 Session 上限（`SessionLimiter`，預設 2000 併發）
@@ -115,12 +117,22 @@ nmap -Pn -p <PORT> --script ssl-cert <HOST>
 
 結果會寫入 `tools/scanner-test/results/scanner-result.json`；未安裝 Nmap 或未執行的檢查會標記為 `NOT_RUN`，不會冒充 PASS。
 
-Standard Security credential regression（只使用合成帳密）：
+合成憑證整合測試（只使用合成帳密，先啟動伺服器）：
 
 ```powershell
+dotnet bin\Release\net10.0\RdpHoneypot.dll --config .\config.json --port 13389
+
+# Standard Security 憑證擷取
 dotnet run --project .\RdpHoneypot.Tests -c Release -- --integration `
-    --host 127.0.0.1 --port 13389 `
-    --log-dir .\bin\Release\net10.0\integration-test-logs
+    --mode standard --host 127.0.0.1 --port 13389 --log-dir .\bin\Release\net10.0\integration-test-logs
+
+# TLS Info PDU 憑證擷取
+dotnet run --project .\RdpHoneypot.Tests -c Release -- --integration `
+    --mode tls --host 127.0.0.1 --port 13389 --log-dir .\bin\Release\net10.0\integration-test-logs
+
+# NLA / NTLM 帳號擷取
+dotnet run --project .\RdpHoneypot.Tests -c Release -- --integration `
+    --mode nla --host 127.0.0.1 --port 13389 --log-dir .\bin\Release\net10.0\integration-test-logs
 ```
 
 > 請勿掃描或誘導未授權的外部系統。對外部署前，應搭配防火牆、隔離網段及明確的客戶授權範圍。
@@ -315,6 +327,7 @@ Scanner 判定為 RDP 服務，不代表本專案提供完整 Windows 桌面；�
   "eventQueueCapacity": 100000,
   "enableRawCapture": false,
   "consoleCredentialMode": "full",
+  "consoleLogLevel": "Credential",
   "logDir": null,
   "profile": {
     "computerName": "WIN-SRV01",
@@ -354,6 +367,7 @@ Scanner 判定為 RDP 服務，不代表本專案提供完整 Windows 桌面；�
 | `eventQueueCapacity` | 整數 | `100000` | 事件佇列容量（預留 Wave 2 使用） |
 | `enableRawCapture` | 布林 | `false` | 是否記錄原始封包（預設關閉，避免磁碟反壓） |
 | `consoleCredentialMode` | 字串 | `masked` | Console 密碼顯示模式：預設 `masked`；授權測試若需即時顯示明文可設定 `full` |
+| `consoleLogLevel` | 字串 | `Credential` | Console 詳細度：`None`、`Error`、`Credential`、`Connection`、`Protocol`、`Debug` |
 | `logDir` | 字串或 null | `null` | 記錄輸出目錄（null = exe 所在目錄） |
 | `profile` | 物件 | 見下表 | 服務指紋、協定選擇、憑證與時序設定 |
 
@@ -406,10 +420,11 @@ Scanner 判定為 RDP 服務，不代表本專案提供完整 Windows 桌面；�
 - `RdpProtocol.cs`：RDP requested/selected protocol enum 與 negotiation failure reason。
 - `RdpServerProfileValidator.cs`：啟動時檢查 Profile、TLS/NLA 能力與憑證身份一致性。
 - `RdpHoneypot.Tests/`：不依賴第三方測試框架的 .NET regression executable。
-- `RdpHoneypot.Tests/IntegrationRunner.cs`：使用合成帳密驗證 Standard Security credential capture。
+- `RdpHoneypot.Tests/IntegrationRunner.cs`：以合成帳密驗證 Standard Security、TLS Info PDU 與 NLA/NTLM 三種憑證擷取路徑（`--mode standard|tls|nla`）。
 - `docs/scanner-compatibility.md`：baseline、實測結果與限制。
 - `tools/scanner-test/run-tests.ps1`：TCP、X.224、TLS、CredSSP、MCS 與可選 Nmap probe。
-- `tools/scanner-test/resource-regression.ps1`：Global Session limit 與 lightweight X.224 回應測試。
+- `tools/scanner-test/resource-regression.ps1`：Global Session limit 與 lightweight X.224 回應測試，結果輸出至 `tools/scanner-test/results/resource-result.json`。
+- `FakeRDP.slnx`：方案檔，包含主程式與測試專案；可一次 `dotnet build/test FakeRDP.slnx -c Release` 建置並執行全部測試。
 
 執行完整本地 regression：
 
@@ -417,6 +432,21 @@ Scanner 判定為 RDP 服務，不代表本專案提供完整 Windows 桌面；�
 dotnet build -c Release
 dotnet run --project .\RdpHoneypot.Tests -c Release
 ```
+
+### 最新驗證狀態（2026-08-19）
+
+本機完整驗證（`127.0.0.1`；Nmap 未安裝，Nmap 項目自動標記 SKIPPED）：
+
+| 驗證項目 | 結果 |
+|---|---|
+| `dotnet build FakeRDP.slnx -c Release` | PASS（0 警告 / 0 錯誤） |
+| `dotnet test FakeRDP.slnx -c Release` | PASS（21/21 測試通過） |
+| Standard Security 整合（合成帳密） | PASS（憑證寫入 `captured_creds.jsonl`） |
+| TLS Info PDU 整合（合成帳密） | PASS |
+| NLA / NTLM 帳號整合（合成帳密） | PASS（帳號寫入 `nla_accounts.jsonl`） |
+| Scanner harness（4499 / 4500 / 13389） | PASS（tcp、x224、rdpDetected、tls、certificate、nla、mcs 全數通過） |
+| 資源迴歸（13390，10 連線） | PASS（sessionLimit / lightweightX224 / sessionDirectoryBounded 全 True） |
+| 實際掃描器連線（4499） | PASS（`192.168.121.153` 送出 `testaccount:123`，已擷取並顯示於 console） |
 
 ---
 

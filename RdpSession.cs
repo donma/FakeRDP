@@ -47,6 +47,7 @@ sealed class RdpSession
 
     readonly RdpSessionState _state = new();
     StreamWriter? _textLog;
+    readonly SemaphoreSlim _logGate = new(1, 1);
     FileStream? _rawLog;
     bool _admitted;
     long _rawBytesWritten;
@@ -108,7 +109,8 @@ sealed class RdpSession
                 _admitted = limiterAcquired && trackerAcquired;
                 if (!_admitted)
                 {
-                    Console.WriteLine($"  [{_id}] Lightweight: admission limit reached, X.224 CC sent");
+                    ConsoleLog(ConsoleLogLevel.Connection,
+                        $"  [{_id}] Lightweight: admission limit reached, X.224 CC sent");
                     return;
                 }
 
@@ -243,7 +245,7 @@ sealed class RdpSession
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            Console.WriteLine($"  [{_id}] ! Error: {ex.Message}");
+            ConsoleLog(ConsoleLogLevel.Error, $"  [{_id}] ! Error: {ex.Message}");
         }
         finally { Cleanup(); }
     }
@@ -286,13 +288,16 @@ sealed class RdpSession
             ClientInfo = cred.ClientInfo,
             SessionDir = Path.Combine(_logDir, $"session_{_id:D6}")
         });
-        Console.ForegroundColor = ConsoleColor.Red;
-        Console.WriteLine($"  ═══ CREDENTIAL CAPTURED ═══");
-        Console.WriteLine($"  IP: {_ep.Address}:{_ep.Port} -> port {_localPort}");
-        Console.WriteLine($"  User: {cred.Username}");
-        Console.WriteLine($"  Pass: {DisplaySecret(cred.Password)}");
-        Console.WriteLine($"  Domain: {cred.Domain}");
-        Console.ResetColor();
+        if (IsConsoleLevelEnabled(ConsoleLogLevel.Credential))
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"  ═══ CREDENTIAL CAPTURED ═══");
+            Console.WriteLine($"  IP: {_ep.Address}:{_ep.Port} -> port {_localPort}");
+            Console.WriteLine($"  User: {cred.Username}");
+            Console.WriteLine($"  Pass: {DisplaySecret(cred.Password)}");
+            Console.WriteLine($"  Domain: {cred.Domain}");
+            Console.ResetColor();
+        }
     }
 
     void SaveNlaCredential(string domain, string username, string? password)
@@ -305,7 +310,7 @@ sealed class RdpSession
             Domain = domain, Username = username, Password = password,
             SessionDir = Path.Combine(_logDir, $"session_{_id:D6}")
         });
-        if (!string.IsNullOrEmpty(password))
+        if (!string.IsNullOrEmpty(password) && IsConsoleLevelEnabled(ConsoleLogLevel.Credential))
         {
             Console.ForegroundColor = ConsoleColor.Red;
             Console.WriteLine($"  ═══ NLA CREDENTIAL CAPTURED ═══");
@@ -327,6 +332,20 @@ sealed class RdpSession
             : $"{credential.Domain}\\{credential.Username}:{DisplaySecret(credential.Password)}";
 
     internal string DisplaySecretForLog(string? secret) => DisplaySecret(secret);
+
+    ConsoleLogLevel ConsoleLevel
+        => Enum.TryParse<ConsoleLogLevel>(_options.ConsoleLogLevel, true, out var level)
+            ? level
+            : ConsoleLogLevel.Credential;
+
+    internal bool IsConsoleLevelEnabled(ConsoleLogLevel level)
+        => ConsoleLevel >= level;
+
+    internal void ConsoleLog(ConsoleLogLevel level, string line)
+    {
+        if (IsConsoleLevelEnabled(level))
+            Console.WriteLine(line);
+    }
 
     internal Task LogAsync(string line) => LogText(line);
 
@@ -364,11 +383,33 @@ sealed class RdpSession
         return [.. names];
     }
 
-    Task LogText(string line)
+    async Task LogText(string line)
     {
-        Console.WriteLine($"  {line}");
-        if (_textLog != null) return _textLog.WriteLineAsync(line);
-        return Task.CompletedTask;
+        var level = line.Contains("[!]", StringComparison.Ordinal) ||
+                    line.Contains("Error", StringComparison.OrdinalIgnoreCase)
+            ? ConsoleLogLevel.Error
+            : line.Contains("CREDENTIAL", StringComparison.OrdinalIgnoreCase) ||
+              line.Contains("credential", StringComparison.OrdinalIgnoreCase) ||
+              line.Contains("TSCredentials", StringComparison.OrdinalIgnoreCase)
+                ? ConsoleLogLevel.Credential
+                : line.Contains("[telemetry]", StringComparison.OrdinalIgnoreCase) ||
+                  line.Contains("RX ", StringComparison.Ordinal) ||
+                  line.Contains("TX ", StringComparison.Ordinal)
+                    ? ConsoleLogLevel.Protocol
+                    : ConsoleLogLevel.Connection;
+        ConsoleLog(level, $"  {line}");
+        if (_textLog == null)
+            return;
+        await _logGate.WaitAsync();
+        try
+        {
+            await _textLog.WriteLineAsync(line);
+            await _textLog.FlushAsync();
+        }
+        finally
+        {
+            _logGate.Release();
+        }
     }
 
     void Cleanup()
@@ -385,7 +426,7 @@ sealed class RdpSession
             _textLog.Close();
         }
         _rawLog?.Close();
-        Console.WriteLine($"[{_id}] - Connection closed");
+        ConsoleLog(ConsoleLogLevel.Connection, $"[{_id}] - Connection closed");
     }
 }
 

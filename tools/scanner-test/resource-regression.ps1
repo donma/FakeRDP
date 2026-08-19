@@ -3,7 +3,8 @@ param(
     [string]$TargetHost = '127.0.0.1',
     [int]$Port = 13390,
     [string]$LogDirectory = 'bin/Release/net10.0/resource-regression-logs',
-    [int]$Connections = 10
+    [int]$Connections = 10,
+    [string]$ResultPath = 'tools/scanner-test/results/resource-result.json'
 )
 
 Set-StrictMode -Version Latest
@@ -61,12 +62,21 @@ finally {
 $after = @((Get-ChildItem -LiteralPath $LogDirectory -Directory -Filter 'session_*' -ErrorAction SilentlyContinue)).Count
 $allX224 = @($results | Where-Object { $_.Tcp -and $_.X224 }).Count -eq $Connections
 $noUnexpectedBurst = ($after - $before) -le 1
-[pscustomobject]@{
-    SessionLimit = $noUnexpectedBurst
-    LightweightX224 = $allX224
-    SessionDirectoryBounded = $noUnexpectedBurst
-    BeforeSessionDirectories = $before
-    AfterSessionDirectories = $after
-    ProbeCount = $Connections
-} | Format-List
+$result = [ordered]@{
+    timestamp = [DateTime]::UtcNow.ToString('O')
+    host = $TargetHost
+    port = $Port
+    sessionLimit = $noUnexpectedBurst
+    lightweightX224 = $allX224
+    sessionDirectoryBounded = $noUnexpectedBurst
+    beforeSessionDirectories = $before
+    afterSessionDirectories = $after
+    probeCount = $Connections
+}
+$resultDirectory = Split-Path -Parent $ResultPath
+if (-not (Test-Path -LiteralPath $resultDirectory)) {
+    New-Item -ItemType Directory -Path $resultDirectory -Force | Out-Null
+}
+$result | ConvertTo-Json | Set-Content -LiteralPath $ResultPath -Encoding utf8
+[pscustomobject]$result | Format-List
 if (-not ($allX224 -and $noUnexpectedBurst)) { exit 1 }

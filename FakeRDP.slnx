@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="RdpHoneypot.csproj" />
+  <Project Path="RdpHoneypot.Tests/RdpHoneypot.Tests.csproj" />
+</Solution>

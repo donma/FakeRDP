@@ -180,9 +180,8 @@ static class CredSspHandler
             var decrypted = decryptor.TransformFinalBlock(encryptedData, 0, encryptedData.Length);
             return ParseTSPasswordCreds(decrypted);
         }
-        catch (Exception ex)
+        catch
         {
-            Console.WriteLine($"  [!] TSCredentials decryption failed: {ex.Message}");
             return null;
         }
     }

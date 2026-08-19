@@ -32,8 +32,10 @@ A defensive RDP honeypot written in C#/.NET 10. Deploy it only on networks and h
 - **Profile consistency validation:** Startup rejects contradictory settings such as NLA without TLS, unimplemented Hybrid-Ex/RDSTLS, invalid certificate parameters, or mismatched certificate identity.
 - **Structured protocol telemetry:** Session logs include requested/selected RDP protocols, cookies, TLS protocol/cipher suite, certificate thumbprint, and state transitions without exposing passwords by default.
 - **Real-time console telemetry:** Credential events show source IP, source port, target port, username, domain, and password in the console; passwords are masked by default and may be explicitly enabled for authorized tests with `consoleCredentialMode=full`.
+- **Console log level:** `consoleLogLevel` controls high-frequency console output with `None`, `Error`, `Credential`, `Connection`, `Protocol`, and `Debug`; session logs still retain protocol details.
 - **Scanner compatibility harness:** PowerShell tools cover X.224, TLS, CredSSP challenge, MCS, multi-port probing, and resource-limit regression.
-- **Automated regression executable:** `RdpHoneypot.Tests` covers protocol selection, RDP_NEG_FAILURE, certificate persistence, MCS builders, credential parsing, and resource limits.
+- **Automated regression executable:** `RdpHoneypot.Tests` covers protocol selection, RDP_NEG_FAILURE, certificate persistence, MCS builders, credential parsing, and resource limits (21/21 tests passing).
+- **Synthetic credential integration:** `--integration --mode standard|tls|nla` verifies the Standard Security, TLS Info PDU, and NLA/NTLM credential-capture paths with synthetic credentials.
 - **No production-system modification:** The program does not create Windows services, modify the registry, or change firewall rules.
 
 ---
@@ -176,12 +178,22 @@ nmap -Pn -p PORT --script ssl-cert HOST
 
 Results are written to `tools/scanner-test/results/scanner-result.json`. Checks that are unavailable or not executed are recorded as `NOT_RUN`, never as a false PASS.
 
-Synthetic Standard Security credential regression:
+Synthetic credential integration (synthetic credentials only; start the server first):
 
 ```powershell
+dotnet bin\Release\net10.0\RdpHoneypot.dll --config .\config.json --port 13389
+
+# Standard Security credential capture
 dotnet run --project .\RdpHoneypot.Tests -c Release -- --integration `
-    --host 127.0.0.1 --port 13389 `
-    --log-dir .\bin\Release\net10.0\integration-test-logs
+    --mode standard --host 127.0.0.1 --port 13389 --log-dir .\bin\Release\net10.0\integration-test-logs
+
+# TLS Info PDU credential capture
+dotnet run --project .\RdpHoneypot.Tests -c Release -- --integration `
+    --mode tls --host 127.0.0.1 --port 13389 --log-dir .\bin\Release\net10.0\integration-test-logs
+
+# NLA / NTLM account capture
+dotnet run --project .\RdpHoneypot.Tests -c Release -- --integration `
+    --mode nla --host 127.0.0.1 --port 13389 --log-dir .\bin\Release\net10.0\integration-test-logs
 ```
 
 Do not scan or lure unauthorized external systems.
@@ -234,6 +246,7 @@ Current `config.json` example:
   "eventQueueCapacity": 100000,
   "enableRawCapture": false,
   "consoleCredentialMode": "full",
+  "consoleLogLevel": "Credential",
   "logDir": null,
   "profile": {
     "computerName": "WIN-SRV01",
@@ -275,6 +288,7 @@ Current `config.json` example:
 | `eventQueueCapacity` | `100000` | Bounded background event queue capacity. |
 | `enableRawCapture` | `false` | Creates per-session `raw.bin` files when enabled. |
 | `consoleCredentialMode` | `masked` | Console password display mode: `masked` by default; set to `full` only for authorized testing. |
+| `consoleLogLevel` | `Credential` | Console verbosity: `None`, `Error`, `Credential`, `Connection`, `Protocol`, or `Debug`. |
 | `logDir` | `null` | Output directory. `null` means the executable directory. |
 
 ### Profile options
@@ -318,10 +332,11 @@ This enhancement adds:
 - `RdpProtocol.cs`: typed requested/selected protocol values and negotiation failure reasons.
 - `RdpServerProfileValidator.cs`: startup validation for Profile, TLS/NLA capabilities, and certificate identity consistency.
 - `RdpHoneypot.Tests/`: a .NET regression executable with no third-party test framework dependency.
-- `RdpHoneypot.Tests/IntegrationRunner.cs`: synthetic Standard Security credential-capture integration test.
+- `RdpHoneypot.Tests/IntegrationRunner.cs`: synthetic credential-capture integration covering Standard Security, TLS Info PDU, and NLA/NTLM (`--mode standard|tls|nla`).
 - `docs/scanner-compatibility.md`: scanner baseline, measured results, and limitations.
 - `tools/scanner-test/run-tests.ps1`: TCP, X.224, TLS, CredSSP, MCS, and optional Nmap probes.
-- `tools/scanner-test/resource-regression.ps1`: global session-limit and lightweight X.224 response test.
+- `tools/scanner-test/resource-regression.ps1`: global session-limit and lightweight X.224 response test; writes JSON results to `tools/scanner-test/results/resource-result.json`.
+- `FakeRDP.slnx`: solution file including the main project and test project; `dotnet build/test FakeRDP.slnx -c Release` builds and runs everything at once.
 
 Run the local regression suite:
 
@@ -329,6 +344,21 @@ Run the local regression suite:
 dotnet build -c Release
 dotnet run --project .\RdpHoneypot.Tests -c Release
 ```
+
+### Latest Validation Status (2026-08-19)
+
+Local validation on `127.0.0.1` (Nmap is not installed, so Nmap checks are marked SKIPPED):
+
+| Check | Result |
+|---|---|
+| `dotnet build FakeRDP.slnx -c Release` | PASS (0 warnings / 0 errors) |
+| `dotnet test FakeRDP.slnx -c Release` | PASS (21/21 tests passing) |
+| Standard Security integration (synthetic credentials) | PASS (credential written to `captured_creds.jsonl`) |
+| TLS Info PDU integration (synthetic credentials) | PASS |
+| NLA / NTLM account integration (synthetic credentials) | PASS (account written to `nla_accounts.jsonl`) |
+| Scanner harness (4499 / 4500 / 13389) | PASS (tcp, x224, rdpDetected, tls, certificate, nla, mcs all true) |
+| Resource regression (13390, 10 probes) | PASS (sessionLimit / lightweightX224 / sessionDirectoryBounded all true) |
+| Live scanner capture (4499) | PASS (`192.168.121.153` sent `testaccount:123`, captured and shown in the console) |
 
 ---
 

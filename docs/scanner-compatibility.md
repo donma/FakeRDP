@@ -2,6 +2,18 @@
 
 This document records the scanner compatibility baseline and the checks run for the current FakeRDP build. Tests are restricted to the local authorized test service.
 
+## Environment
+
+| Field | Value |
+|---|---|
+| FakeRDP commit | `67ba002` baseline before this validation round |
+| .NET SDK | `10.0.202` |
+| OS | Windows 10 build 22000 |
+| Nmap | `SKIPPED - NMAP NOT INSTALLED` |
+| FreeRDP | `SKIPPED - FREERDP NOT INSTALLED` |
+| mstsc | `C:\\Windows\\System32\\mstsc.exe` available; manual interaction required |
+| Test date | 2026-08-18 |
+
 ## Scope and limitations
 
 FakeRDP is an RDP protocol honeypot, not a Windows desktop or authentication service. It intentionally implements the protocol stages needed for defensive observation and credential telemetry. A scanner identifying RDP does not imply that a full desktop session is available.
@@ -23,10 +35,21 @@ nmap -Pn -p PORT --script ssl-cert HOST
 The repository harness runs the same commands when `nmap.exe` is available:
 
 ```powershell
-.\tools\scanner-test\run-tests.ps1 -TargetHost 127.0.0.1 -Port 4499 -SkipNmap
+.\tools\scanner-test\run-tests.ps1 -TargetHost 127.0.0.1 -Port '4499,4500,13389'
 ```
 
-Omit `-SkipNmap` to run Nmap. Results are written to `tools/scanner-test/results/scanner-result.json`, which is intentionally ignored by Git because it is a local test artifact.
+Use `-SkipNmap` only when Nmap is unavailable. Results are written to `tools/scanner-test/results/scanner-result.json`, which is intentionally ignored by Git because it is a local test artifact. Raw command output is saved per port under:
+
+```text
+tools/scanner-test/results/port-4499/
+├── tcp.txt
+├── service-version.txt
+├── service-version-all.txt
+├── rdp-enum-encryption.txt
+└── ssl-cert.txt
+```
+
+When Nmap is unavailable, each file contains `SKIPPED - NMAP NOT INSTALLED`; no fake scanner result is generated.
 
 ## Baseline recorded before protocol changes
 
@@ -58,23 +81,23 @@ The baseline intentionally distinguishes protocol evidence from unavailable exte
 The local PowerShell harness was run after the changes with:
 
 ```powershell
-.\tools\scanner-test\run-tests.ps1 -TargetHost 127.0.0.1 -Port '4499,4500,4501' -SkipNmap
+.\tools\scanner-test\run-tests.ps1 -TargetHost 127.0.0.1 -Port '4499,4500,13389' -SkipNmap
 ```
 
-| Test | 4499 | 4500 | 4501 |
-|---|---|---|---|
-| TCP reachability | PASS | PASS | PASS |
-| X.224 negotiation / RDP detection | PASS | PASS | PASS |
-| TLS 1.2 negotiation | PASS | PASS | PASS |
-| TLS certificate presented | PASS | PASS | PASS |
-| HYBRID/NLA selection and CredSSP challenge | PASS | PASS | PASS |
-| MCS Connect / Erect / Attach / Channel Join probe | PASS | PASS | PASS |
-| Nmap `-sV` | NOT RUN | NOT RUN | NOT RUN |
-| Nmap `rdp-enum-encryption` | NOT RUN | NOT RUN | NOT RUN |
-| Nmap `ssl-cert` | NOT RUN | NOT RUN | NOT RUN |
-| mstsc credential flow | NOT RUN | NOT RUN | NOT RUN |
+All three configured non-standard ports completed the native protocol probe:
 
-Nmap was not installed on the test host, so no Nmap service-name claim is made. The harness JSON recorded `tcp`, `x224`, `rdpDetected`, `tls`, `certificate`, `nla`, and `mcs` as true for all three local ports. `credentialRegression` remains false in the scanner harness because it does not fabricate or store credentials; the synthetic credential parser regression is covered by the unit executable below.
+| Test | 4499 | 4500 | 13389 |
+|---|---|---|---|
+| TCP | PASS | PASS | PASS |
+| X.224 / RDP detection | PASS | PASS | PASS |
+| TLS 1.2 / certificate | PASS | PASS | PASS |
+| CredSSP challenge | PASS | PASS | PASS |
+| MCS probe | PASS | PASS | PASS |
+| Nmap commands | SKIPPED - NMAP NOT INSTALLED | SKIPPED - NMAP NOT INSTALLED | SKIPPED - NMAP NOT INSTALLED |
+
+Raw command result files were written under `tools/scanner-test/results/port-4499/`, `port-4500/`, and `port-13389/`.
+
+Nmap was not installed on the test host, so no Nmap service-name claim is made. The harness JSON recorded native TCP, X.224, TLS, certificate, NLA, and MCS probe results for all three local ports. `credentialRegression` remains false in the scanner harness because it does not fabricate or store credentials; credential capture is verified by the dedicated integration runner below.
 
 ## Current compatibility checks
 
@@ -96,6 +119,30 @@ Run it with:
 
 ```powershell
 dotnet run --project .\RdpHoneypot.Tests -c Release
+```
+
+## PASS / PARTIAL / FAIL
+
+- **PASS**: the protocol probe completed the relevant stage, such as X.224 negotiation, TLS, or MCS/security capability response.
+- **PARTIAL**: the scanner completed earlier stages but stopped at a later stage; record the last state instead of calling the entire test a failure.
+- **FAIL**: malformed response, immediate reset, timeout, unhandled exception, or other protocol failure.
+
+## mstsc Regression Record
+
+`mstsc.exe` is installed, but this non-interactive validation run did not launch an interactive credential session. Result:
+
+```text
+X224: NOT RUN - manual client interaction required
+TLS/certificate warning: NOT RUN
+MCS: NOT RUN
+Credential capture: NOT RUN
+Disconnect: NOT RUN
+```
+
+## FreeRDP Regression Record
+
+```text
+SKIPPED - FREERDP NOT INSTALLED
 ```
 
 ## Interpretation

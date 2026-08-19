@@ -174,6 +174,15 @@ function Test-Port {
         nla = $false
         mcs = $false
         credentialRegression = $false
+        tcpOpen = $false
+        rdpProtocolDetected = $false
+        serviceName = ''
+        tlsDetected = $false
+        nlaDetected = $false
+        rdpEncryptionProbe = $false
+        errors = @()
+        rawOutputDirectory = ''
+        nmapStatus = 'NOT_RUN'
         nmap = @{}
         error = $null
     }
@@ -186,12 +195,15 @@ function Test-Port {
         $negotiation = Send-X224Probe $stream 0x03
         $result.x224 = $negotiation.Response.Length -ge 19 -and -not $negotiation.Failure
         $result.rdpDetected = $result.x224
+        $result.rdpProtocolDetected = $result.rdpDetected
         $result.nla = $negotiation.SelectedProtocol -eq 0x02
+        $result.nlaDetected = $result.nla
         if ($negotiation.SelectedProtocol -in @(0x01, 0x02)) {
             $callback = [System.Net.Security.RemoteCertificateValidationCallback]{ param($sender, $certificate, $chain, $errors) $true }
             $ssl = [System.Net.Security.SslStream]::new($stream, $false, $callback)
             $ssl.AuthenticateAsClient($TargetHost, $null, [System.Security.Authentication.SslProtocols]::Tls12, $false)
             $result.tls = $ssl.IsAuthenticated
+            $result.tlsDetected = $result.tls
             $result.certificate = $ssl.RemoteCertificate -ne $null
             if ($negotiation.SelectedProtocol -eq 0x02) {
                 $result.nla = Test-CredSspChallenge $ssl
@@ -202,28 +214,52 @@ function Test-Port {
     }
     catch {
         $result.error = $_.Exception.Message
+        $result.errors += $_.Exception.Message
     }
     finally {
         $client.Dispose()
     }
 
-    if (-not $SkipNmap -and (Get-Command nmap -ErrorAction SilentlyContinue)) {
+    $rawDirectory = Join-Path $OutputDirectory ("port-$TargetPort")
+    if (-not (Test-Path -LiteralPath $rawDirectory)) {
+        New-Item -ItemType Directory -Path $rawDirectory -Force | Out-Null
+    }
+    $result.rawOutputDirectory = $rawDirectory
+    $nmapSpecs = @(
+        [pscustomobject]@{ Name = 'tcp'; File = 'tcp.txt'; Args = @('-Pn', '-p', "$TargetPort", $TargetHost) },
+        [pscustomobject]@{ Name = 'serviceVersion'; File = 'service-version.txt'; Args = @('-Pn', '-sV', '-p', "$TargetPort", $TargetHost) },
+        [pscustomobject]@{ Name = 'serviceVersionAll'; File = 'service-version-all.txt'; Args = @('-Pn', '-sV', '--version-all', '-p', "$TargetPort", $TargetHost) },
+        [pscustomobject]@{ Name = 'rdpEnumEncryption'; File = 'rdp-enum-encryption.txt'; Args = @('-Pn', '-p', "$TargetPort", '--script', 'rdp-enum-encryption', $TargetHost) },
+        [pscustomobject]@{ Name = 'sslCert'; File = 'ssl-cert.txt'; Args = @('-Pn', '-p', "$TargetPort", '--script', 'ssl-cert', $TargetHost) }
+    )
+    $nmapPath = Get-Command nmap -ErrorAction SilentlyContinue
+    if (-not $SkipNmap -and $null -ne $nmapPath) {
+        $result.nmapStatus = 'EXECUTED'
         $nmapResults = [ordered]@{}
-        foreach ($arguments in @(
-            @('-Pn', '-p', "$TargetPort", $TargetHost),
-            @('-Pn', '-sV', '-p', "$TargetPort", $TargetHost),
-            @('-Pn', '-sV', '--version-all', '-p', "$TargetPort", $TargetHost),
-            @('-Pn', '-p', "$TargetPort", '--script', 'rdp-enum-encryption', $TargetHost),
-            @('-Pn', '-p', "$TargetPort", '--script', 'ssl-cert', $TargetHost)
-        )) {
-            $key = ($arguments -join ' ').Replace(' ', '_').Replace('--', '')
-            $nmapResults[$key] = (& nmap @arguments 2>&1 | Out-String).Trim()
+        foreach ($spec in $nmapSpecs) {
+            $nmapOutput = & nmap @($spec.Args) 2>&1
+            $exitCode = $LASTEXITCODE
+            $text = ($nmapOutput | Out-String).Trim()
+            Set-Content -LiteralPath (Join-Path $rawDirectory $spec.File) -Value $text -Encoding utf8
+            $nmapResults[$spec.Name] = [ordered]@{ exitCode = $exitCode; output = $text }
+            if ($spec.Name -eq 'serviceVersion' -and $text -match '(?im)^\|?\s*(ms-wbt-server|Microsoft Terminal Services)') {
+                $result.serviceName = $Matches[1]
+            }
+            if ($spec.Name -eq 'rdpEnumEncryption' -and $exitCode -eq 0 -and $text -match '(?i)RDP|CredSSP|TLS|SSL') {
+                $result.rdpEncryptionProbe = $true
+            }
         }
         $result.nmap = $nmapResults
     }
     else {
-        $result.nmap = @{ status = 'NOT_RUN'; reason = 'nmap executable not installed or SkipNmap was specified' }
+        $reason = if ($SkipNmap) { 'SKIPPED - SkipNmap specified' } else { 'SKIPPED - NMAP NOT INSTALLED' }
+        $result.nmapStatus = 'SKIPPED'
+        foreach ($spec in $nmapSpecs) {
+            Set-Content -LiteralPath (Join-Path $rawDirectory $spec.File) -Value $reason -Encoding utf8
+        }
+        $result.nmap = [ordered]@{ status = 'NOT_RUN'; reason = $reason }
     }
+    $result.tcpOpen = $result.tcp
     return [pscustomobject]$result
 }
 
@@ -239,6 +275,7 @@ $results = foreach ($p in $portValues) {
 
 $output = [ordered]@{
     generatedAt = [DateTime]::UtcNow.ToString('O')
+    timestamp = [DateTime]::UtcNow.ToString('O')
     host = $TargetHost
     results = @($results)
 }

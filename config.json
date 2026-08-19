@@ -13,6 +13,7 @@
   "eventQueueCapacity": 100000,
   "enableRawCapture": false,
   "consoleCredentialMode": "full",
+  "consoleLogLevel": "Credential",
   "logDir": null,
   "profile": {
     "computerName": "WIN-SRV01",

@@ -1,6 +1,8 @@
 bin/
 obj/
 logs/
+server.stdout.log
+server.stderr.log
 tools/scanner-test/results/
 tls-server.pfx
 *.user
