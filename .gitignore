@@ -4,6 +4,7 @@ logs/
 sessions/
 server.stdout.log
 server.stderr.log
+server.pid
 *.pfx
 *.key
 credentials*.jsonl
