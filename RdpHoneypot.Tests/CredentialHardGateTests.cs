@@ -143,9 +143,9 @@ public sealed class CredentialHardGateTests : IDisposable
     }
 
     [Fact]
-    public void SourceIpNormalize_Null_ReturnsZero()
+    public void SourceIpNormalize_Null_ReturnsNull()
     {
-        Assert.Equal("0.0.0.0", SourceIpNormalizer.Normalize(null));
+        Assert.Null(SourceIpNormalizer.Normalize(null));
     }
 
     /// <summary>CredentialEventsDropped 正常為 0（§11）</summary>
@@ -177,5 +177,44 @@ public sealed class CredentialHardGateTests : IDisposable
         await Task.Delay(500);
         Assert.Equal(0, recorder.CredentialEventsDropped);
         Assert.Equal(50, recorder.CredentialEventsAccepted);
+    }
+
+    /// <summary>
+    /// Shutdown flush（第 3 點驗證）：enqueue credential 後立即 Dispose，
+    /// 最後 credentials 檔案仍存在（即時 shutdown 不丟帳密）。
+    /// </summary>
+    [Fact]
+    public async Task CredentialFlushOnShutdown_DoesNotLoseCredential()
+    {
+        var dir = CreateTempDir();
+        var recorder = new EventRecorder(64, dir);
+        // 模擬：Parse password → enqueue → 立即 shutdown（不等待背景 flush）
+        var evt = new HoneypotEvent
+        {
+            EventType = "credential",
+            Event = "credential_captured",
+            SessionId = 42,
+            Timestamp = DateTime.UtcNow,
+            SourceIp = "192.168.1.10",
+            SourcePort = 51000,
+            TargetPort = 4499,
+            Domain = "TESTDOMAIN",
+            Username = "shutdown-user",
+            Password = "Shutdown-Pass-999!",
+            AuthMode = "standard"
+        };
+        var ok = await recorder.TryWriteCredentialAsync(evt);
+        Assert.True(ok, "enqueue should succeed");
+
+        // 立即 Dispose（等同 OS service stop 瞬間），不 sleep
+        recorder.Dispose();
+
+        // 檔案必須存在且含完整密碼
+        var path = Path.Combine(dir, "captured_creds.jsonl");
+        Assert.True(File.Exists(path), "credential file must exist after immediate Dispose");
+        var content = await File.ReadAllTextAsync(path);
+        Assert.Contains("shutdown-user", content);
+        Assert.Contains("Shutdown-Pass-999!", content);
+        Assert.Equal(0, recorder.CredentialEventsDropped);
     }
 }

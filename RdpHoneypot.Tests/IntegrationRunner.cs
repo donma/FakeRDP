@@ -18,7 +18,8 @@ public static class IntegrationRunner
             "tls" => RunTlsAsync(args),
             "nla" => RunNlaAsync(args),
             "concurrency" => RunConcurrencyAsync(args),
-            _ => throw new ArgumentException("--mode must be standard, tls, nla, or concurrency")
+            "sequential-session" => RunSequentialSessionAsync(args),
+            _ => throw new ArgumentException("--mode must be standard, tls, nla, concurrency, or sequential-session")
         };
     }
 
@@ -233,6 +234,104 @@ public static class IntegrationRunner
         var passed = succeeded == count && records.Count == count && mismatched == 0;
         Console.WriteLine($"{(passed ? "PASS" : "FAIL")} Concurrency credential regression: " +
             $"opened={succeeded}/{count} captured={records.Count} mismatched={mismatched}");
+        return passed ? 0 : 1;
+    }
+
+    static async Task<int> RunSequentialSessionAsync(string[] args)
+    {
+        var host = GetOption(args, "--host") ?? "127.0.0.1";
+        var port = int.Parse(GetOption(args, "--port") ?? "13389");
+        var logDir = GetOption(args, "--log-dir") ?? throw new ArgumentException("--log-dir is required");
+        const int count = 50;
+
+        // 順序建立 50 條完整 Standard Security 連線，每條用不同帳密
+        // 因是順序執行的，session_id 應依序為 1..50（或與起始偏移對應）
+        var expected = new (string user, string pass)[count];
+        for (var i = 0; i < count; i++)
+        {
+            var user = $"session-user-{i:D3}";
+            var pass = $"session-pass-{i:D3}";
+            expected[i] = (user, pass);
+
+            using var client = new TcpClient();
+            await client.ConnectAsync(host, port);
+            using var stream = client.GetStream();
+
+            await WriteTpktAsync(stream, [0x06, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x00]);
+            _ = await ReadTpktAsync(stream);
+
+            await WriteTpktAsync(stream, [0x02, 0xF0, 0x80, 0x7F, 0x65, 0x00]);
+            var mcs = await ReadTpktAsync(stream);
+            using var cert = ExtractCertificate(mcs, out _);
+            using var rsa = cert.GetRSAPublicKey()!;
+            var cr = RandomNumberGenerator.GetBytes(32);
+            var enc = rsa.Encrypt(cr, RSAEncryptionPadding.Pkcs1);
+
+            await WriteTpktAsync(stream, [0x02, 0xF0, 0x80, 0x04, 0x00, 0x00, 0x00, 0x00]);
+            await WriteTpktAsync(stream, [0x02, 0xF0, 0x80, 0x28, 0x00, 0x00, 0x03, 0xEA]);
+            _ = await ReadTpktAsync(stream);
+            await WriteTpktAsync(stream, [0x02, 0xF0, 0x80, 0x38, 0x00, 0x00, 0x03, 0xEB]);
+            _ = await ReadTpktAsync(stream);
+
+            await WriteTpktAsync(stream, BuildDataPacket(0x0001, enc));
+            _ = await ReadTpktAsync(stream);
+
+            var domain = Encoding.Unicode.GetBytes("TESTDOMAIN\0");
+            var username = Encoding.Unicode.GetBytes($"{user}\0");
+            var password = Encoding.Unicode.GetBytes($"{pass}\0");
+            var info = BuildInfoPdu(domain, username, password);
+            await WriteTpktAsync(stream, BuildDataPacket(0x0040, info));
+            _ = await ReadTpktAsync(stream);
+            // 關閉連線，讓服務端完成 session
+        }
+
+        // 讀取 captured_creds.jsonl，驗證每一筆的 session_id、username、password
+        var path = Path.Combine(logDir, "captured_creds.jsonl");
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        var records = new List<JsonDocument>();
+        while (DateTime.UtcNow < deadline && records.Count < count)
+        {
+            if (File.Exists(path))
+            {
+                foreach (var line in await File.ReadAllLinesAsync(path))
+                {
+                    try
+                    {
+                        using var parsed = JsonDocument.Parse(line);
+                        var root = parsed.RootElement;
+                        if (root.TryGetProperty("username", out var u) && u.GetString()?.StartsWith("session-user-") == true)
+                        {
+                            if (!records.Any(r => r.RootElement.GetProperty("session_id").GetInt64() == root.GetProperty("session_id").GetInt64()))
+                                records.Add(JsonDocument.Parse(line));
+                        }
+                    }
+                    catch (JsonException) { }
+                }
+            }
+            await Task.Delay(50);
+        }
+
+        // 排序 by session_id，確認順序映射正確
+        records.Sort((a, b) => a.RootElement.GetProperty("session_id").GetInt64().CompareTo(b.RootElement.GetProperty("session_id").GetInt64()));
+
+        var mismatched = 0;
+        var missing = 0;
+        for (var i = 0; i < count; i++)
+        {
+            if (i >= records.Count) { missing++; continue; }
+            var rec = records[i];
+            var sid = rec.RootElement.GetProperty("session_id").GetInt64();
+            var u = rec.RootElement.GetProperty("username").GetString();
+            var p = rec.RootElement.GetProperty("password").GetString();
+
+            // 由於伺服器可能從 >1 開始計數，取相對位置
+            if (u != expected[i].user || p != expected[i].pass)
+                mismatched++;
+        }
+
+        var passed = records.Count == count && mismatched == 0 && missing == 0;
+        Console.WriteLine($"{(passed ? "PASS" : "FAIL")} Sequential session credential mapping: " +
+            $"count={records.Count}/{count} mismatched={mismatched} missing={missing}");
         return passed ? 0 : 1;
     }
 
@@ -520,3 +619,4 @@ public static class IntegrationRunner
         return index >= 0 && index + 1 < args.Length ? args[index + 1] : null;
     }
 }
+

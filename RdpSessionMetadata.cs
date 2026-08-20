@@ -20,9 +20,9 @@ internal sealed record RdpSessionMetadata(
 /// </summary>
 internal static class SourceIpNormalizer
 {
-    public static string Normalize(IPAddress? ip)
+    public static string? Normalize(IPAddress? ip)
     {
-        if (ip is null) return "0.0.0.0";
+        if (ip is null) return null;
         if (ip.IsIPv4MappedToIPv6)
             ip = ip.MapToIPv4();
         return ip.ToString();

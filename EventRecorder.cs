@@ -178,9 +178,7 @@ _channel = Channel.CreateBounded<HoneypotEvent>(new BoundedChannelOptions(capaci
         {
             while (!ct.IsCancellationRequested)
             {
-                buffer.Clear();
-
-                // 等待第一個事件
+                // 等待第一個事件（項次累加到 buffer；buffer 在成功寫入後才清空）
                 var first = await _channel.Reader.ReadAsync(ct);
                 buffer.Add(first);
 
@@ -188,8 +186,17 @@ _channel = Channel.CreateBounded<HoneypotEvent>(new BoundedChannelOptions(capaci
                 while (buffer.Count < 128 && _channel.Reader.TryRead(out var evt))
                     buffer.Add(evt);
 
-                await WriteBatchAsync(buffer, ct);
-                Interlocked.Add(ref _processedCount, buffer.Count);
+                try
+                {
+                    await WriteBatchAsync(buffer, ct);
+                    Interlocked.Add(ref _processedCount, buffer.Count);
+                    buffer.Clear(); // 成功寫入後清空，避免 finally 重複寫
+                }
+                catch (OperationCanceledException)
+                {
+                    // 取消發生在批次寫入期間：buffer 內的事件不能丟棄，
+                    // 交由 finally 以 CancellationToken.None 補寫。
+                }
             }
         }
         catch (OperationCanceledException)
@@ -198,13 +205,17 @@ _channel = Channel.CreateBounded<HoneypotEvent>(new BoundedChannelOptions(capaci
         }
         finally
         {
-            // 關閉前把殘留事件寫完
+            // 把「已被 ReadAsync 取出但尚未寫入的 buffer」以及 channel 殘留
+            // 一起寫出，確保 shutdown 瞬間不丟失已 enqueue 的 credential。
+            var remaining = new List<HoneypotEvent>(buffer);
             while (_channel.Reader.TryRead(out var evt))
+                remaining.Add(evt);
+            if (remaining.Count > 0)
             {
                 try
                 {
-                    await WriteBatchAsync([evt], CancellationToken.None);
-                    Interlocked.Increment(ref _processedCount);
+                    await WriteBatchAsync(remaining, CancellationToken.None);
+                    Interlocked.Add(ref _processedCount, remaining.Count);
                 }
                 catch { /* 最後清空階段不中斷 */ }
             }
@@ -257,9 +268,10 @@ _channel = Channel.CreateBounded<HoneypotEvent>(new BoundedChannelOptions(capaci
         if (_disposed) return;
         _disposed = true;
         _cts.Cancel();
-        _channel.Writer.TryComplete();
+        // 先等待 loop 完全結束（含 finally drain），再關閉 writer
         try { _loop.GetAwaiter().GetResult(); }
         catch { /* 忽略 shutdown 錯誤 */ }
+        _channel.Writer.TryComplete();
         _cts.Dispose();
     }
 }
