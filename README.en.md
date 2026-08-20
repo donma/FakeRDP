@@ -34,8 +34,9 @@ A defensive RDP honeypot written in C#/.NET 10. Deploy it only on networks and h
 - **Real-time console telemetry:** Credential events show source IP, source port, target port, username, domain, and password in the console; passwords are masked by default and may be explicitly enabled for authorized tests with `consoleCredentialMode=full`.
 - **Console log level:** `consoleLogLevel` controls high-frequency console output with `None`, `Error`, `Credential`, `Connection`, `Protocol`, and `Debug`; session logs still retain protocol details.
 - **Scanner compatibility harness:** PowerShell tools cover X.224, TLS, CredSSP challenge, MCS, multi-port probing, and resource-limit regression.
-- **Automated regression executable:** `RdpHoneypot.Tests` covers protocol selection, RDP_NEG_FAILURE, certificate persistence, MCS builders, credential parsing, and resource limits (21/21 tests passing).
-- **Synthetic credential integration:** `--integration --mode standard|tls|nla` verifies the Standard Security, TLS Info PDU, and NLA/NTLM credential-capture paths with synthetic credentials.
+- **Automated regression executable:** `RdpHoneypot.Tests` covers protocol selection, RDP_NEG_FAILURE, certificate persistence, MCS builders, credential parsing, EventRecorder schema, console masking, source IP normalization, and resource limits (29/29 tests passing).
+- **Credential Capture Hard Gate:** unified credential event schema (`event` / `auth_mode` / `requested_protocol` / `selected_protocol` / `cookie` / `computer_name`), source IP from the TCP socket peer (not from client-provided headers), credentials never silently dropped (`CredentialEventsDropped = 0`), and a flush-guaranteed shutdown path.
+- **Synthetic credential integration:** `--integration --mode standard|tls|nla|concurrency|sequential-session` verifies the Standard Security, TLS Info PDU, and NLA/NTLM paths, plus 50 parallel sessions and 50 sequential sessions with SessionId → credential mapping (no cross-wiring).
 - **No production-system modification:** The program does not create Windows services, modify the registry, or change firewall rules.
 
 ---
@@ -353,7 +354,7 @@ Local validation on `127.0.0.1` via `tools/ai-validation/run-validation.ps1` (Nm
 | Check | Result |
 |---|---|
 | `dotnet build FakeRDP.slnx -c Release` | PASS (0 warnings / 0 errors) |
-| `dotnet test FakeRDP.slnx -c Release` | PASS (21/21 tests passing) |
+| `dotnet test FakeRDP.slnx -c Release` | PASS (29/29 tests passing) |
 | Standard Security integration (synthetic credentials) | PASS (credential written to `captured_creds.jsonl`) |
 | TLS Info PDU integration (synthetic credentials) | PASS |
 | NLA / NTLM account integration (synthetic credentials) | PASS (account written to `nla_accounts.jsonl`) |
@@ -390,7 +391,7 @@ bin\Release\net10.0\
 `captured_creds.jsonl` contains one compact JSON object per line. Example values below are synthetic:
 
 ```json
-{"session_id":42,"timestamp":"2026-01-01T00:00:00Z","source_ip":"10.0.0.100","source_port":55000,"target_port":4499,"username":"test-user","password":"example-password","domain":"WORKGROUP","client_info":"cookie='Cookie: mstshash=test-user'"}
+{"event":"credential_captured","session_id":42,"timestamp":"2026-01-01T00:00:00Z","source_ip":"10.0.0.100","source_port":55000,"target_port":4499,"username":"test-user","password":"example-password","domain":"WORKGROUP","auth_mode":"standard","requested_protocol":"STANDARD","selected_protocol":"Standard","cookie":"mstshash=test-user","computer_name":"WIN-SRV01","client_info":"cookie='Cookie: mstshash=test-user'"}
 ```
 
 Read the latest record in PowerShell:
