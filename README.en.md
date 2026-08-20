@@ -34,9 +34,9 @@ A defensive RDP honeypot written in C#/.NET 10. Deploy it only on networks and h
 - **Real-time console telemetry:** Credential events show source IP, source port, target port, username, domain, and password in the console; passwords are masked by default and may be explicitly enabled for authorized tests with `consoleCredentialMode=full`.
 - **Console log level:** `consoleLogLevel` controls high-frequency console output with `None`, `Error`, `Credential`, `Connection`, `Protocol`, and `Debug`; session logs still retain protocol details.
 - **Scanner compatibility harness:** PowerShell tools cover X.224, TLS, CredSSP challenge, MCS, multi-port probing, and resource-limit regression.
-- **Automated regression executable:** `RdpHoneypot.Tests` covers protocol selection, RDP_NEG_FAILURE, certificate persistence, MCS builders, credential parsing, EventRecorder schema, console masking, source IP normalization, and resource limits (29/29 tests passing).
-- **Credential Capture Hard Gate:** unified credential event schema (`event` / `auth_mode` / `requested_protocol` / `selected_protocol` / `cookie` / `computer_name`), source IP from the TCP socket peer (not from client-provided headers), credentials never silently dropped (`CredentialEventsDropped = 0`), and a flush-guaranteed shutdown path.
-- **Synthetic credential integration:** `--integration --mode standard|tls|nla|concurrency|sequential-session` verifies the Standard Security, TLS Info PDU, and NLA/NTLM paths, plus 50 parallel sessions and 50 sequential sessions with SessionId → credential mapping (no cross-wiring).
+- **Automated regression executable:** `RdpHoneypot.Tests` covers protocol selection, RDP_NEG_FAILURE, certificate persistence, MCS builders, credential parsing, EventRecorder schema, console masking, source IP normalization, credential shutdown flush, and resource limits (30/30 tests passing).
+- **Credential Capture Hard Gate:** unified credential event schema (`event` / `auth_mode` / `requested_protocol` / `selected_protocol` / `cookie` / `computer_name`), source IP from the TCP socket peer (not from client-provided headers), credentials never silently dropped (`CredentialEventsDropped = 0`), a flush-guaranteed shutdown path (the server awaits all active sessions and calls `CompleteAsync` before exiting, verified by a 50-round race test), and a `CredentialPersistFailures` counter that surfaces disk-write failures.
+- **Synthetic credential integration:** `--integration --mode standard|tls|nla|concurrency|concurrent-mapping|sequential-session|shutdown-flush` verifies the Standard Security, TLS Info PDU, and NLA/NTLM paths, plus 50 parallel sessions (with full `source_port → session_id → username/password` mapping), 50 sequential sessions, and a 50-round shutdown race test.
 - **No production-system modification:** The program does not create Windows services, modify the registry, or change firewall rules.
 
 ---
@@ -354,10 +354,13 @@ Local validation on `127.0.0.1` via `tools/ai-validation/run-validation.ps1` (Nm
 | Check | Result |
 |---|---|
 | `dotnet build FakeRDP.slnx -c Release` | PASS (0 warnings / 0 errors) |
-| `dotnet test FakeRDP.slnx -c Release` | PASS (29/29 tests passing) |
+| `dotnet test FakeRDP.slnx -c Release` | PASS (30/30 tests passing) |
 | Standard Security integration (synthetic credentials) | PASS (credential written to `captured_creds.jsonl`) |
 | TLS Info PDU integration (synthetic credentials) | PASS |
 | NLA / NTLM account integration (synthetic credentials) | PASS (account written to `nla_accounts.jsonl`) |
+| 50 parallel sessions mapping (`concurrent-mapping`) | PASS (3 rounds × 50 sessions, `source_port→session_id→user/pass` chain verified, 0 cross-wired) |
+| 50 sequential sessions mapping (`sequential-session`) | PASS (50/50, 0 cross-wired) |
+| 50-round shutdown flush test (`shutdown-flush`) | PASS (50/50, credential persisted exactly once per round) |
 | Native protocol probe (4499 / 4500 / 13389) | PASS (tcp, x224, rdpDetected, tls, certificate, nla, mcs all true) |
 | **Nmap Service Detection (-sV)** | **PASS** (`ms-wbt-server` / RDP on all three ports) |
 | **Nmap --version-all** | PASS (identified as RDP on all three ports) |

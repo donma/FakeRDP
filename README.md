@@ -22,9 +22,9 @@
 - **協定遙測**：Session log 記錄 requested/selected protocol、Cookie/mstshash、TLS protocol/cipher suite、certificate thumbprint 與 state transition
 - **Profile 一致性驗證**：啟動時拒絕 NLA 無 TLS、未實作 Hybrid-Ex、未實作 RDSTLS、無效憑證參數或身份不一致設定
 - **Scanner compatibility harness**：提供 X.224、TLS、CredSSP challenge、MCS、多 Port 與資源限制的 PowerShell 測試工具
-- **自動回歸測試**：`RdpHoneypot.Tests` 涵蓋協定選擇、RDP_NEG_FAILURE、憑證持久化、MCS builder、credential parser、EventRecorder schema、Console 遮罩、來源 IP 正常化與資源限制（29/29 測試通過）
-- **Credential Capture Hard Gate**：統一 credential event schema（`event` / `auth_mode` / `requested_protocol` / `selected_protocol` / `cookie` / `computer_name`）；來源 IP 一律取 TCP socket peer（禁止 client payload 宣告的 IP）；Credential 事件絕不靜默丟棄（`CredentialEventsDropped = 0`）；shutdown 瞬間也不丟帳密（立即 `Dispose()` 仍會 flush）
-- **合成憑證整合測試**：`--integration --mode standard|tls|nla|concurrency|sequential-session` — 三條憑證擷取路徑 + 50 條平行併發 session + 50 條順序 session 逐一驗證 SessionId → 帳密映射（無串線）
+- **自動回歸測試**：`RdpHoneypot.Tests` 涵蓋協定選擇、RDP_NEG_FAILURE、憑證持久化、MCS builder、credential parser、EventRecorder schema、Console 遮罩、來源 IP 正常化、credential shutdown flush 與資源限制（30/30 測試通過）
+- **Credential Capture Hard Gate**：統一 credential event schema（`event` / `auth_mode` / `requested_protocol` / `selected_protocol` / `cookie` / `computer_name`）；來源 IP 一律取 TCP socket peer（禁止 client payload 宣告的 IP）；Credential 事件絕不靜默丟棄（`CredentialEventsDropped = 0`）；shutdown 瞬間也不丟帳密（server 停止前 await 所有 active session 完成 + `CompleteAsync` drain，經 50 輪 race test 驗證）；`CredentialPersistFailures` 計數器監控磁碟寫入失敗
+- **合成憑證整合測試**：`--integration --mode standard|tls|nla|concurrency|concurrent-mapping|sequential-session|shutdown-flush` — 三條憑證擷取路徑 + 50 條平行併發 session（含 `source_port→session_id→user/pass` 完整映射驗證） + 50 條順序 session + 50 輪 shutdown race test
 - **雙檔記錄**：JSONL 匯總檔 + 每 session 獨立目錄（文字日誌 + 原始封包）
 - **資源保護（高併發防耗盡）**：
   - 全域 Session 上限（`SessionLimiter`，預設 2000 併發）
@@ -442,10 +442,13 @@ dotnet run --project .\RdpHoneypot.Tests -c Release
 | 驗證項目 | 結果 |
 |---|---|
 | `dotnet build FakeRDP.slnx -c Release` | PASS（0 警告 / 0 錯誤） |
-| `dotnet test FakeRDP.slnx -c Release` | PASS（29/29 測試通過） |
+| `dotnet test FakeRDP.slnx -c Release` | PASS（30/30 測試通過） |
 | Standard Security 整合（合成帳密） | PASS（憑證寫入 `captured_creds.jsonl`） |
 | TLS Info PDU 整合（合成帳密） | PASS |
 | NLA / NTLM 帳號整合（合成帳密） | PASS（帳號寫入 `nla_accounts.jsonl`） |
+| 50 條平行併發 Session 映射（`concurrent-mapping`） | PASS（3 rounds × 50 sessions，`source_port→session_id→user/pass` 全鏈驗證，0 cross-wired） |
+| 50 條順序 Session 映射（`sequential-session`） | PASS（50/50，0 串線） |
+| 50 輪 Shutdown 瞬間不丟帳密（`shutdown-flush`） | PASS（50/50，credential 恰好一次） |
 | 原生協定 probe（4499 / 4500 / 13389） | PASS（tcp、x224、rdpDetected、tls、certificate、nla、mcs 全數通過） |
 | **Nmap Service Detection（-sV）** | **PASS**（三埠皆判定為 `ms-wbt-server` / RDP） |
 | **Nmap --version-all** | PASS（三埠皆識別為 RDP） |
