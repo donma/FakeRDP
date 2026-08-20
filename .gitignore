@@ -1,8 +1,12 @@
 bin/
 obj/
 logs/
+sessions/
 server.stdout.log
 server.stderr.log
+*.pfx
+*.key
+credentials*.jsonl
 tools/scanner-test/results/
 tools/ai-validation/results/
 tools/ai-validation/runtime-config.json

@@ -44,6 +44,7 @@ sealed class RdpSession
     readonly SessionLimiter _limiter;
     readonly IpConnectionTracker _tracker;
     readonly EventRecorder _recorder;
+    readonly RdpSessionMetadata _metadata;
 
     readonly RdpSessionState _state = new();
     StreamWriter? _textLog;
@@ -63,6 +64,7 @@ sealed class RdpSession
         _serverCert = serverCert; _tlsCert = tlsCert;
         _rsaKey = rsaKey; _tlsRsaKey = tlsRsaKey; _serverRandom = serverRandom;
         _limiter = limiter; _tracker = tracker; _recorder = recorder;
+        _metadata = new RdpSessionMetadata(id, ep.Address, ep.Port, localPort, DateTimeOffset.UtcNow);
     }
 
     public async Task RunAsync(CancellationToken ct)
@@ -179,9 +181,9 @@ sealed class RdpSession
                     var creds = await CredSspHandler.HandleNlaAsync(this, stream, ct);
                     if (creds != null)
                     {
-                        SaveNlaCredential(creds.Value.domain, creds.Value.username, creds.Value.password);
+                        await SaveNlaCredentialAsync(creds.Value.domain, creds.Value.username, creds.Value.password);
                         var msg = creds.Value.password != null
-                            ? $"  >>> NLA credential: {creds.Value.domain}\\{creds.Value.username}:{DisplaySecret(creds.Value.password)}"
+                            ? $"  >>> NLA credential: {creds.Value.domain}\\{creds.Value.username}:{DisplaySecretForLog(creds.Value.password)}"
                             : $"  >>> NLA account: {creds.Value.domain}\\{creds.Value.username}";
                         await LogText(msg);
                     }
@@ -232,7 +234,7 @@ sealed class RdpSession
                     if (_state.Credential != null)
                     {
                         await LogText($"  >>> CAPTURED credential: {FormatCredentialForLog(_state.Credential)}");
-                        SaveCredential(_state.Credential);
+                        await SaveCredentialAsync(_state.Credential);
                         await RdpDisconnectHandler.ApplyAfterCaptureAsync(this, ct);
                         _state.Credential = null;
                     }
@@ -275,63 +277,105 @@ sealed class RdpSession
         _ => Task.FromResult<byte[]?>(null)
     };
 
-    // ── 儲存 / 記錄 ──
+// ── 儲存 / 記錄 ──
 
-    void SaveCredential(CapturedCredential cred)
+    static string ProtocolNamesString(RdpRequestedProtocol protocols)
     {
-        _recorder.TryWrite(new HoneypotEvent
+        if (protocols == RdpRequestedProtocol.Standard)
+            return "STANDARD";
+        var names = new List<string>();
+        foreach (var value in Enum.GetValues<RdpRequestedProtocol>())
+        {
+            if (value != RdpRequestedProtocol.Standard && protocols.HasFlag(value))
+                names.Add(value.ToString().ToUpperInvariant());
+        }
+        return string.Join("|", names);
+    }
+
+    async Task<bool> SaveCredentialAsync(CapturedCredential cred)
+    {
+        var evt = new HoneypotEvent
         {
             EventType = "credential",
-            SessionId = _id, Timestamp = DateTime.UtcNow,
-            SourceIp = _ep.Address.ToString(), SourcePort = _ep.Port, TargetPort = _localPort,
-            Username = cred.Username, Password = cred.Password, Domain = cred.Domain,
+            Event = "credential_captured",
+            SessionId = _id,
+            Timestamp = DateTime.UtcNow,
+            SourceIp = SourceIpNormalizer.Normalize(_metadata.SourceIp),
+            SourcePort = _metadata.SourcePort,
+            TargetPort = _metadata.TargetPort,
+            Username = cred.Username,
+            Password = cred.Password,
+            Domain = cred.Domain,
+            AuthMode = _state.UseTls ? "tls" : "standard",
+            RequestedProtocol = ProtocolNamesString(_state.RequestedProtocols),
+            SelectedProtocol = _state.SelectedProtocol.ToString(),
+            Cookie = _state.Mstshash ?? _state.RawCookie,
+            ComputerName = Profile.ComputerName,
             ClientInfo = cred.ClientInfo,
             SessionDir = Path.Combine(_logDir, $"session_{_id:D6}")
-        });
+        };
+        var ok = await _recorder.TryWriteCredentialAsync(evt);
+        if (!ok)
+            ConsoleLog(ConsoleLogLevel.Error,
+                $"[{_id}] CRITICAL: credential event queue full, credential dropped!");
         if (IsConsoleLevelEnabled(ConsoleLogLevel.Credential))
         {
             Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine($"  ═══ CREDENTIAL CAPTURED ═══");
-            Console.WriteLine($"  IP: {_ep.Address}:{_ep.Port} -> port {_localPort}");
+            Console.WriteLine($"  {'═'}{'═'}{'═'} CREDENTIAL CAPTURED {'═'}{'═'}{'═'}");
+            Console.WriteLine($"  IP: {evt.SourceIp}:{evt.SourcePort} -> port {evt.TargetPort}");
             Console.WriteLine($"  User: {cred.Username}");
-            Console.WriteLine($"  Pass: {DisplaySecret(cred.Password)}");
+            Console.WriteLine($"  Pass: {CredentialMasking.Display(cred.Password, _options.ConsoleCredentialMode)}");
             Console.WriteLine($"  Domain: {cred.Domain}");
             Console.ResetColor();
         }
+        return ok;
     }
 
-    void SaveNlaCredential(string domain, string username, string? password)
+    async Task<bool> SaveNlaCredentialAsync(string domain, string username, string? password)
     {
-        _recorder.TryWrite(new HoneypotEvent
+        var evt = new HoneypotEvent
         {
             EventType = "nla_credential",
-            SessionId = _id, Timestamp = DateTime.UtcNow,
-            SourceIp = _ep.Address.ToString(), SourcePort = _ep.Port, TargetPort = _localPort,
-            Domain = domain, Username = username, Password = password,
+            Event = "credential_captured",
+            SessionId = _id,
+            Timestamp = DateTime.UtcNow,
+            SourceIp = SourceIpNormalizer.Normalize(_metadata.SourceIp),
+            SourcePort = _metadata.SourcePort,
+            TargetPort = _metadata.TargetPort,
+            Domain = domain,
+            Username = username,
+            Password = password,
+            AuthMode = "nla",
+            RequestedProtocol = ProtocolNamesString(_state.RequestedProtocols),
+            SelectedProtocol = _state.SelectedProtocol.ToString(),
+            Cookie = _state.Mstshash ?? _state.RawCookie,
+            ComputerName = Profile.ComputerName,
             SessionDir = Path.Combine(_logDir, $"session_{_id:D6}")
-        });
-        if (!string.IsNullOrEmpty(password) && IsConsoleLevelEnabled(ConsoleLogLevel.Credential))
+        };
+        var ok = await _recorder.TryWriteCredentialAsync(evt);
+        if (!ok)
+            ConsoleLog(ConsoleLogLevel.Error,
+                $"[{_id}] CRITICAL: NLA credential event queue full, credential dropped!");
+        if (IsConsoleLevelEnabled(ConsoleLogLevel.Credential))
         {
             Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine($"  ═══ NLA CREDENTIAL CAPTURED ═══");
-            Console.WriteLine($"  IP: {_ep.Address}:{_ep.Port} -> port {_localPort}");
-            Console.WriteLine($"  User: {username}"); Console.WriteLine($"  Pass: {DisplaySecret(password)}");
+            Console.WriteLine($"  {'═'}{'═'}{'═'} NLA CREDENTIAL CAPTURED {'═'}{'═'}{'═'}");
+            Console.WriteLine($"  IP: {evt.SourceIp}:{evt.SourcePort} -> port {evt.TargetPort}");
+            Console.WriteLine($"  User: {username}");
+            if (!string.IsNullOrEmpty(password))
+                Console.WriteLine($"  Pass: {CredentialMasking.Display(password, _options.ConsoleCredentialMode)}");
             Console.WriteLine($"  Domain: {domain}");
             Console.ResetColor();
         }
+        return ok;
     }
-
-    string DisplaySecret(string? secret)
-        => string.Equals(_options.ConsoleCredentialMode, "full", StringComparison.OrdinalIgnoreCase)
-            ? secret ?? "<empty>"
-            : "********";
 
     string FormatCredentialForLog(CapturedCredential? credential)
         => credential is null
             ? "<none>"
-            : $"{credential.Domain}\\{credential.Username}:{DisplaySecret(credential.Password)}";
+            : $"{credential.Domain}\\{credential.Username}:{CredentialMasking.Display(credential.Password, _options.ConsoleCredentialMode)}";
 
-    internal string DisplaySecretForLog(string? secret) => DisplaySecret(secret);
+    internal string DisplaySecretForLog(string? secret) => CredentialMasking.Display(secret, _options.ConsoleCredentialMode);
 
     ConsoleLogLevel ConsoleLevel
         => Enum.TryParse<ConsoleLogLevel>(_options.ConsoleLogLevel, true, out var level)

@@ -17,7 +17,8 @@ public static class IntegrationRunner
             "standard" => RunStandardAsync(args),
             "tls" => RunTlsAsync(args),
             "nla" => RunNlaAsync(args),
-            _ => throw new ArgumentException("--mode must be standard, tls, or nla")
+            "concurrency" => RunConcurrencyAsync(args),
+            _ => throw new ArgumentException("--mode must be standard, tls, nla, or concurrency")
         };
     }
 
@@ -52,53 +53,17 @@ public static class IntegrationRunner
         await WriteTpktAsync(stream, BuildDataPacket(0x0001, encryptedRandom));
         _ = await ReadTpktAsync(stream);
 
-        var domain = Encoding.Unicode.GetBytes("WORKGROUP\0");
-        var username = Encoding.Unicode.GetBytes("integration-user\0");
-        var password = Encoding.Unicode.GetBytes("integration-password\0");
-        var info = new byte[18 + domain.Length + username.Length + password.Length + 16];
-        BitConverter.GetBytes(0u).CopyTo(info, 0);
-        BitConverter.GetBytes(0u).CopyTo(info, 4);
-        BitConverter.GetBytes((ushort)domain.Length).CopyTo(info, 8);
-        BitConverter.GetBytes((ushort)username.Length).CopyTo(info, 10);
-        BitConverter.GetBytes((ushort)password.Length).CopyTo(info, 12);
-        domain.CopyTo(info, 18);
-        username.CopyTo(info, 18 + domain.Length);
-        password.CopyTo(info, 18 + domain.Length + username.Length);
+        var domain = Encoding.Unicode.GetBytes("TESTDOMAIN\0");
+        var username = Encoding.Unicode.GetBytes("test-standard-user\0");
+        var password = Encoding.Unicode.GetBytes("Standard-Pass-123!\0");
+        var info = BuildInfoPdu(domain, username, password);
 
         await WriteTpktAsync(stream, BuildDataPacket(0x0040, info));
         _ = await ReadTpktAsync(stream);
         client.Close();
 
-        var recordPath = Path.Combine(logDir, "captured_creds.jsonl");
-        var deadline = DateTime.UtcNow.AddSeconds(3);
-        JsonDocument? record = null;
-        while (DateTime.UtcNow < deadline && record is null)
-        {
-            if (File.Exists(recordPath))
-            {
-                foreach (var line in await File.ReadAllLinesAsync(recordPath))
-                {
-                    try
-                    {
-                        using var parsed = JsonDocument.Parse(line);
-                        var root = parsed.RootElement;
-                        if (root.TryGetProperty("username", out var user) &&
-                            user.GetString() == "integration-user")
-                        {
-                            record = JsonDocument.Parse(line);
-                            break;
-                        }
-                    }
-                    catch (JsonException) { }
-                }
-            }
-            if (record is null)
-                await Task.Delay(50);
-        }
-
-        var passed = record is not null &&
-            record.RootElement.GetProperty("password").GetString() == "integration-password" &&
-            record.RootElement.GetProperty("target_port").GetInt32() == port;
+        var passed = await VerifyCredentialAsync(logDir, "captured_creds.jsonl",
+            "test-standard-user", "Standard-Pass-123!", "TESTDOMAIN", host, port);
         Console.WriteLine($"{(passed ? "PASS" : "FAIL")} Standard Security credential capture integration");
         return passed ? 0 : 1;
     }
@@ -117,14 +82,15 @@ public static class IntegrationRunner
         // before Info PDU even on TLS; send a bounded synthetic exchange first.
         await WriteTpktAsync(stream, BuildDataPacket(0x0001, RandomNumberGenerator.GetBytes(256)));
         _ = await ReadTpktAsync(stream);
-        var domain = Encoding.Unicode.GetBytes("WORKGROUP\0");
-        var username = Encoding.Unicode.GetBytes("tls-integration-user\0");
-        var password = Encoding.Unicode.GetBytes("tls-integration-password\0");
+        var domain = Encoding.Unicode.GetBytes("TESTDOMAIN\0");
+        var username = Encoding.Unicode.GetBytes("test-tls-user\0");
+        var password = Encoding.Unicode.GetBytes("TLS-Pass-123!\0");
         var info = BuildInfoPdu(domain, username, password);
         await WriteTpktAsync(stream, BuildDataPacket(0x0040, info));
         _ = await ReadTpktAsync(stream);
         client.Close();
-        var passed = await WaitForCredentialAsync(logDir, "tls-integration-user", "tls-integration-password", port);
+        var passed = await VerifyCredentialAsync(logDir, "captured_creds.jsonl",
+            "test-tls-user", "TLS-Pass-123!", "TESTDOMAIN", host, port);
         Console.WriteLine($"{(passed ? "PASS" : "FAIL")} TLS Info PDU credential capture integration");
         return passed ? 0 : 1;
     }
@@ -143,11 +109,11 @@ public static class IntegrationRunner
         var challenge = await ReadDerMessageAsync(stream);
         if (!ContainsNtlmType(challenge, 2))
             throw new InvalidDataException("NLA challenge was not received.");
-        var type3 = BuildNtlmType3("nla-integration-user", "WORKGROUP");
+        var type3 = BuildNtlmType3("test-nla-user", "TESTDOMAIN");
         await stream.WriteAsync(BuildTsRequest(type3));
         _ = await ReadDerMessageAsync(stream);
         await stream.WriteAsync(new byte[] { 0x30, 0x00 });
-        var account = await WaitForNlaAccountAsync(logDir, "nla-integration-user", port);
+        var account = await WaitForNlaAccountAsync(logDir, "test-nla-user", port, host, "TESTDOMAIN");
         client.Close();
         Console.WriteLine($"{(account ? "PASS" : "FAIL")} NLA account capture integration");
         return account ? 0 : 1;
@@ -169,6 +135,106 @@ public static class IntegrationRunner
     static byte[] BuildNegotiationRequest(uint protocol)
         => [0x03, 0x00, 0x00, 0x13, 0x0E, 0xE0, 0, 0, 0, 0, 0,
             0x01, 0, 8, 0, (byte)protocol, (byte)(protocol >> 8), 0, 0];
+
+    static async Task<int> RunConcurrencyAsync(string[] args)
+    {
+        var host = GetOption(args, "--host") ?? "127.0.0.1";
+        var port = int.Parse(GetOption(args, "--port") ?? "13389");
+        var logDir = GetOption(args, "--log-dir") ?? throw new ArgumentException("--log-dir is required");
+        const int count = 50;
+        var tasks = new Task<(int index, bool ok)>[count];
+        for (var i = 0; i < count; i++)
+        {
+            var idx = i;
+            tasks[i] = Task.Run(async () =>
+            {
+                var user = $"user-{idx:D3}";
+                var pass = $"pass-{idx:D3}";
+                try
+                {
+                    using var client = new TcpClient();
+                    await client.ConnectAsync(host, port);
+                    using var stream = client.GetStream();
+                    await WriteTpktAsync(stream, [0x06, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x00]);
+                    _ = await ReadTpktAsync(stream);
+                    await WriteTpktAsync(stream, [0x02, 0xF0, 0x80, 0x7F, 0x65, 0x00]);
+                    var mcs = await ReadTpktAsync(stream);
+                    using var cert = ExtractCertificate(mcs, out _);
+                    using var rsa = cert.GetRSAPublicKey()!;
+                    var cr = RandomNumberGenerator.GetBytes(32);
+                    await WriteTpktAsync(stream, [0x02, 0xF0, 0x80, 0x04, 0x00, 0x00, 0x00, 0x00]);
+                    await WriteTpktAsync(stream, [0x02, 0xF0, 0x80, 0x28, 0x00, 0x00, 0x03, 0xEA]);
+                    _ = await ReadTpktAsync(stream);
+                    await WriteTpktAsync(stream, [0x02, 0xF0, 0x80, 0x38, 0x00, 0x00, 0x03, 0xEB]);
+                    _ = await ReadTpktAsync(stream);
+                    var enc = rsa.Encrypt(cr, RSAEncryptionPadding.Pkcs1);
+                    await WriteTpktAsync(stream, BuildDataPacket(0x0001, enc));
+                    _ = await ReadTpktAsync(stream);
+                    var domain = Encoding.Unicode.GetBytes("TESTDOMAIN\0");
+                    var username = Encoding.Unicode.GetBytes($"{user}\0");
+                    var password = Encoding.Unicode.GetBytes($"{pass}\0");
+                    var info = BuildInfoPdu(domain, username, password);
+                    await WriteTpktAsync(stream, BuildDataPacket(0x0040, info));
+                    _ = await ReadTpktAsync(stream);
+                    return (idx, true);
+                }
+                catch
+                {
+                    return (idx, false);
+                }
+            });
+        }
+        var results = await Task.WhenAll(tasks);
+        var succeeded = results.Count(r => r.ok);
+
+        // 驗證 captured_creds.jsonl 中有 50 筆不同 user，且密碼正確、無串線
+        var path = Path.Combine(logDir, "captured_creds.jsonl");
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        List<JsonDocument> records = [];
+        while (DateTime.UtcNow < deadline && records.Count < count)
+        {
+            if (File.Exists(path))
+            {
+                foreach (var line in await File.ReadAllLinesAsync(path))
+                {
+                    try
+                    {
+                        using var parsed = JsonDocument.Parse(line);
+                        var root = parsed.RootElement;
+                        if (root.TryGetProperty("username", out var u) && u.GetString()?.StartsWith("user-") == true)
+                        {
+                            // 避免重複加入
+                            if (!records.Any(r => r.RootElement.GetProperty("username").GetString() == u.GetString()))
+                                records.Add(JsonDocument.Parse(line));
+                        }
+                    }
+                    catch (JsonException) { }
+                }
+            }
+            await Task.Delay(50);
+        }
+        var userMap = new Dictionary<string, string>();
+        var mismatched = 0;
+        foreach (var rec in records)
+        {
+            var u = rec.RootElement.GetProperty("username").GetString()!;
+            var p = rec.RootElement.GetProperty("password").GetString()!;
+            var expectedPass = $"pass-{u.Replace("user-", "")}";
+            if (userMap.TryGetValue(u, out var existingPass))
+            {
+                if (existingPass != p) mismatched++;
+            }
+            else
+            {
+                userMap[u] = p;
+                if (p != expectedPass) mismatched++;
+            }
+        }
+        var passed = succeeded == count && records.Count == count && mismatched == 0;
+        Console.WriteLine($"{(passed ? "PASS" : "FAIL")} Concurrency credential regression: " +
+            $"opened={succeeded}/{count} captured={records.Count} mismatched={mismatched}");
+        return passed ? 0 : 1;
+    }
 
     static async Task RunMcsToSecurityAsync(Stream stream)
     {
@@ -222,7 +288,50 @@ public static class IntegrationRunner
         return false;
     }
 
-    static async Task<bool> WaitForNlaAccountAsync(string logDir, string username, int port)
+    /// <summary>
+    /// 驗證 captured_creds.jsonl 或 nla_accounts.jsonl 中的一筆 credential event，
+    /// 檢查 username、password（若指定非 null）、domain、source_ip、target_port。
+    /// </summary>
+    static async Task<bool> VerifyCredentialAsync(string logDir, string fileName,
+        string username, string? password, string domain, string expectedSourceIp, int expectedPort)
+    {
+        var path = Path.Combine(logDir, fileName);
+        var deadline = DateTime.UtcNow.AddSeconds(3);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (File.Exists(path))
+            {
+                foreach (var line in await File.ReadAllLinesAsync(path))
+                {
+                    try
+                    {
+                        using var json = JsonDocument.Parse(line);
+                        var root = json.RootElement;
+                        // 基本欄位
+                        if (root.GetProperty("username").GetString() != username) continue;
+                        if (password != null && root.GetProperty("password").GetString() != password) continue;
+                        if (root.GetProperty("domain").GetString() != domain) continue;
+                        if (root.GetProperty("source_ip").GetString() != expectedSourceIp) continue;
+                        if (root.GetProperty("target_port").GetInt32() != expectedPort) continue;
+                        // 新 schema 欄位（§3）：event, auth_mode, requested_protocol, selected_protocol, cookie, computer_name
+                        string eventVal = "";
+                        if (root.TryGetProperty("event", out var evtProp)) eventVal = evtProp.GetString() ?? "";
+                        if (eventVal != "credential_captured") continue;
+                        // 至少要有 auth_mode
+                        if (!root.TryGetProperty("auth_mode", out var authMode) || string.IsNullOrEmpty(authMode.GetString())) continue;
+                        // 若 password 為 null（NLA 路徑），確認序列化為 null 而非空字串
+                        if (password == null && root.TryGetProperty("password", out var passProp) && passProp.ValueKind != JsonValueKind.Null) continue;
+                        return true;
+                    }
+                    catch (JsonException) { }
+                }
+            }
+            await Task.Delay(50);
+        }
+        return false;
+    }
+
+    static async Task<bool> WaitForNlaAccountAsync(string logDir, string username, int port, string expectedSourceIp, string expectedDomain)
     {
         var path = Path.Combine(logDir, "nla_accounts.jsonl");
         var deadline = DateTime.UtcNow.AddSeconds(3);
@@ -237,7 +346,9 @@ public static class IntegrationRunner
                         using var json = JsonDocument.Parse(line);
                         var root = json.RootElement;
                         if (root.GetProperty("username").GetString() == username &&
-                            root.GetProperty("target_port").GetInt32() == port)
+                            root.GetProperty("target_port").GetInt32() == port &&
+                            root.GetProperty("source_ip").GetString() == expectedSourceIp &&
+                            root.GetProperty("domain").GetString() == expectedDomain)
                             return true;
                     }
                     catch (JsonException) { }

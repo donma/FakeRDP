@@ -167,6 +167,16 @@ Other automated results in `summary.json` / `validation-report.md`:
 - Resource regression: PASS. Certificate persistence: PASS (thumbprint stable across 3 restarts).
 - Overall: **PARTIAL** (all locally verifiable checks and Nmap Service Detection pass; rdp-enum-encryption could not be completed on this host, so per policy it is not reported as PASS).
 
+## Credential Capture Regression
+
+| Mode | Source IP | Username | Password | Domain | Auth Mode | Result |
+|---|---|---|---|---|---|---|
+| Standard Security | PASS (`127.0.0.1`) | PASS (`test-standard-user`) | PASS (`Standard-Pass-123!`) | PASS (`TESTDOMAIN`) | `standard` | **PASS** |
+| TLS Info PDU | PASS (`127.0.0.1`) | PASS (`test-tls-user`) | PASS (`TLS-Pass-123!`) | PASS (`TESTDOMAIN`) | `tls` | **PASS** |
+| NLA / NTLM | PASS (`127.0.0.1`) | PASS (`test-nla-user`) | N/A (null) | PASS (`TESTDOMAIN`) | `nla` | **PASS** |
+
+All credential events include the unified schema (§3): `event: "credential_captured"`, `auth_mode`, `requested_protocol`, `selected_protocol`, `cookie`, `computer_name`. Password is `null` for NLA paths where the client does not provide plaintext TSCredentials. Console masking (`consoleCredentialMode: masked`) replaces the password with `********` but does not alter the stored event. `CredentialEventsDropped` counters are verified to be `0`.
+
 ## FreeRDP Regression Record
 
 ```text
