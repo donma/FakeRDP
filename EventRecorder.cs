@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading;
 using System.Threading.Channels;
 
 namespace RdpHoneypot;
@@ -85,10 +86,15 @@ public sealed class EventRecorder : IDisposable
     readonly CancellationTokenSource _cts;
     readonly Task _loop;
     readonly string _logDir;
+    TaskCompletionSource? _testGate;
 
-    // ── 計數器（§25） ──
+    // ── 計數器（§16） ──
+    static readonly TimeSpan CredentialWriteTimeout = TimeSpan.FromSeconds(2);
+
+    long _credentialAttemptedCount;
     long _credentialAcceptedCount;
     long _credentialDroppedCount;
+    long _credentialPersistedCount;
     long _credentialPersistFailCount;
     long _credentialWithPasswordCount;
     long _credentialWithoutPasswordCount;
@@ -96,8 +102,10 @@ public sealed class EventRecorder : IDisposable
     long _processedCount;
 
     public int Capacity { get; }
+    public long CredentialEventsAttempted => Interlocked.Read(ref _credentialAttemptedCount);
     public long CredentialEventsAccepted => Interlocked.Read(ref _credentialAcceptedCount);
     public long CredentialEventsDropped => Interlocked.Read(ref _credentialDroppedCount);
+    public long CredentialEventsPersisted => Interlocked.Read(ref _credentialPersistedCount);
     public long CredentialPersistFailures => Interlocked.Read(ref _credentialPersistFailCount);
     public long CredentialEventsWithPassword => Interlocked.Read(ref _credentialWithPasswordCount);
     public long CredentialEventsWithoutPassword => Interlocked.Read(ref _credentialWithoutPasswordCount);
@@ -110,11 +118,14 @@ public sealed class EventRecorder : IDisposable
     public (long processed, long dropped) GetStats()
         => (Interlocked.Read(ref _processedCount), DroppedCount);
 
-    public EventRecorder(int capacity, string logDir)
+public EventRecorder(int capacity, string logDir)
+        : this(capacity, logDir, startPaused: false) { }
+
+    public EventRecorder(int capacity, string logDir, bool startPaused)
     {
         Capacity = capacity;
         _logDir = logDir;
-_channel = Channel.CreateBounded<HoneypotEvent>(new BoundedChannelOptions(capacity)
+        _channel = Channel.CreateBounded<HoneypotEvent>(new BoundedChannelOptions(capacity)
         {
             SingleReader = true,
             SingleWriter = false,
@@ -123,6 +134,8 @@ _channel = Channel.CreateBounded<HoneypotEvent>(new BoundedChannelOptions(capaci
             FullMode = BoundedChannelFullMode.Wait
         });
         _cts = new CancellationTokenSource();
+        if (startPaused)
+            _testGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         _loop = RecordLoopAsync(_cts.Token);
     }
 
@@ -151,14 +164,23 @@ _channel = Channel.CreateBounded<HoneypotEvent>(new BoundedChannelOptions(capaci
     }
 
     /// <summary>
-    /// 安全寫入 credential 事件：使用 Wait 模式 channel 的 WriteAsync，
-    /// 確保不靜默丟棄（除非取消）。正常狀況下 CredentialEventsDropped 應為 0。
+    /// 安全寫入 credential 事件：使用 bounded timeout (2s) + linked CTS，
+    /// 確保不靜默丟棄（除非 timeout）。正常狀況下 CredentialEventsDropped 應為 0。
+    ///
+    /// 計數器語意（§16）：
+    ///   Attempted = 被呼叫
+    ///   Accepted = 成功放進 Channel
+    ///   Dropped = 無法放進 Channel（timeout / cancellation）
     /// </summary>
     public async Task<bool> TryWriteCredentialAsync(HoneypotEvent evt, CancellationToken outerCt = default)
     {
+        Interlocked.Increment(ref _credentialAttemptedCount);
+        using var timeoutCts = new CancellationTokenSource(CredentialWriteTimeout);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(outerCt, timeoutCts.Token);
         try
         {
-            await _channel.Writer.WriteAsync(evt, outerCt);
+            await _channel.Writer.WriteAsync(evt, linkedCts.Token);
+            // 成功進 Channel 後才計入 Accepted
             Interlocked.Increment(ref _credentialAcceptedCount);
             if (!string.IsNullOrEmpty(evt.Password))
                 Interlocked.Increment(ref _credentialWithPasswordCount);
@@ -166,12 +188,29 @@ _channel = Channel.CreateBounded<HoneypotEvent>(new BoundedChannelOptions(capaci
                 Interlocked.Increment(ref _credentialWithoutPasswordCount);
             return true;
         }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !outerCt.IsCancellationRequested)
+        {
+            // 真正的 timeout（非外部的 cancellation）
+            Interlocked.Increment(ref _credentialDroppedCount);
+            return false;
+        }
         catch (OperationCanceledException)
         {
+            // 外部的 cancellation（例如 server shutdown）
             Interlocked.Increment(ref _credentialDroppedCount);
             return false;
         }
     }
+
+    /// <summary>
+    /// 測試用：暫停 consumer 讓 queue 滿，驗證 bounded timeout 行為。
+    /// </summary>
+    internal void PauseConsumerForTest() => _testGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>
+    /// 測試用：釋放 consumer。
+    /// </summary>
+    internal void ReleaseConsumerForTest() { Volatile.Read(ref _testGate)?.TrySetResult(); }
 
     async Task RecordLoopAsync(CancellationToken ct)
     {
@@ -180,6 +219,11 @@ _channel = Channel.CreateBounded<HoneypotEvent>(new BoundedChannelOptions(capaci
         {
             while (!ct.IsCancellationRequested)
             {
+                // 測試 hook：若 consumer 被暫停，等 gate 釋放再繼續
+                var gate = Volatile.Read(ref _testGate);
+                if (gate is not null && !gate.Task.IsCompleted)
+                    await gate.Task;
+
                 // 等待第一個事件（項次累加到 buffer；buffer 在成功寫入後才清空）
                 var first = await _channel.Reader.ReadAsync(ct);
                 buffer.Add(first);
@@ -271,6 +315,9 @@ _channel = Channel.CreateBounded<HoneypotEvent>(new BoundedChannelOptions(capaci
         // 使用 FileShare.Read 讓測試讀取時不會被鎖住
         using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read, 4096, true);
         await fs.WriteAsync(Encoding.UTF8.GetBytes(sb.ToString()), ct);
+        // 成功寫入磁碟後計入 Persisted
+        if (fileName == "captured_creds.jsonl" || fileName == "nla_accounts.jsonl")
+            Interlocked.Add(ref _credentialPersistedCount, events.Count);
     }
 
     bool _disposed;

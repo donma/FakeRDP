@@ -331,6 +331,15 @@ sealed class RdpSession
         return ok;
     }
 
+    /// <summary>
+    /// 測試用 hook：讓 xunit test 直接走真正 Session 的 credential path，
+    /// 不需要模擬網路連線（§5）。
+    /// </summary>
+    internal async Task<bool> SaveCredentialForTestAsync(string username, string? password, string? domain)
+    {
+        return await SaveCredentialAsync(new CapturedCredential(username, password, domain, null));
+    }
+
     async Task<bool> SaveNlaCredentialAsync(string domain, string username, string? password)
     {
         var evt = new HoneypotEvent
