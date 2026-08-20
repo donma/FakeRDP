@@ -148,6 +148,41 @@ public sealed class CredentialHardGateTests : IDisposable
         Assert.Null(SourceIpNormalizer.Normalize(null));
     }
 
+    /// <summary>P1：schema 序列化時 source_ip 必須是 JSON null，禁止 "0.0.0.0"/"unknown"/""</summary>
+    [Fact]
+    public async Task SourceIp_Null_SerializesAsJsonNull()
+    {
+        var dir = CreateTempDir();
+        using var recorder = new EventRecorder(64, dir);
+        var evt = new HoneypotEvent
+        {
+            EventType = "credential",
+            Event = "credential_captured",
+            SessionId = 7,
+            Timestamp = DateTime.UtcNow,
+            SourceIp = null, // 未知來源
+            SourcePort = 0,
+            TargetPort = 4499,
+            Domain = "TESTDOMAIN",
+            Username = "unknown-ip-user",
+            Password = "pass",
+            AuthMode = "standard"
+        };
+        var ok = await recorder.TryWriteCredentialAsync(evt);
+        Assert.True(ok);
+
+        var path = Path.Combine(dir, "captured_creds.jsonl");
+        var line = await WaitForFileAsync(path);
+        using var json = JsonDocument.Parse(line);
+        var root = json.RootElement;
+        Assert.Equal(JsonValueKind.Null, root.GetProperty("source_ip").ValueKind);
+        // 明確禁止假來源
+        var raw = line;
+        Assert.DoesNotContain("\"source_ip\":\"0.0.0.0\"", raw);
+        Assert.DoesNotContain("\"source_ip\":\"unknown\"", raw);
+        Assert.DoesNotContain("\"source_ip\":\"\"", raw);
+    }
+
     /// <summary>CredentialEventsDropped 正常為 0（§11）</summary>
     [Fact]
     public async Task CredentialEventsDropped_Zero_UnderNormalLoad()

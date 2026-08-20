@@ -1,3 +1,5 @@
+using System.Threading;
+using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Cryptography;
@@ -17,9 +19,11 @@ public static class IntegrationRunner
             "standard" => RunStandardAsync(args),
             "tls" => RunTlsAsync(args),
             "nla" => RunNlaAsync(args),
-            "concurrency" => RunConcurrencyAsync(args),
+"concurrency" => RunConcurrencyAsync(args),
+            "concurrent-mapping" => RunConcurrentMappingAsync(args),
+            "shutdown-flush" => RunShutdownFlushAsync(args),
             "sequential-session" => RunSequentialSessionAsync(args),
-            _ => throw new ArgumentException("--mode must be standard, tls, nla, concurrency, or sequential-session")
+            _ => throw new ArgumentException("--mode must be standard, tls, nla, concurrency, concurrent-mapping, or sequential-session")
         };
     }
 
@@ -237,7 +241,272 @@ public static class IntegrationRunner
         return passed ? 0 : 1;
     }
 
-    static async Task<int> RunSequentialSessionAsync(string[] args)
+    static async Task<int> RunConcurrentMappingAsync(string[] args)
+    {
+        var host = GetOption(args, "--host") ?? "127.0.0.1";
+        var port = int.Parse(GetOption(args, "--port") ?? "13389");
+        var logDir = GetOption(args, "--log-dir") ?? throw new ArgumentException("--log-dir is required");
+        var rounds = int.Parse(GetOption(args, "--rounds") ?? "3");
+        const int count = 50;
+
+        var allOk = true;
+        for (var round = 0; round < rounds; round++)
+        {
+            var clients = new TcpClient[count];
+            var tasks = new Task<(int port, string user, string pass, bool ok)>[count];
+            try
+            {
+                for (var i = 0; i < count; i++)
+                {
+                    var idx = i;
+                    var user = $"map-user-{round:D1}-{idx:D3}";
+                    var pass = $"map-pass-{round:D1}-{idx:D3}";
+                    tasks[i] = Task.Run(async () =>
+                    {
+                        var client = new TcpClient();
+                        clients[idx] = client;
+                        try
+                        {
+                            await client.ConnectAsync(host, port);
+                            var localPort = ((IPEndPoint)client.Client.LocalEndPoint!).Port;
+                            using var stream = client.GetStream();
+                            await WriteTpktAsync(stream, [0x06, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x00]);
+                            _ = await ReadTpktAsync(stream);
+                            await WriteTpktAsync(stream, [0x02, 0xF0, 0x80, 0x7F, 0x65, 0x00]);
+                            var mcs = await ReadTpktAsync(stream);
+                            using var cert = ExtractCertificate(mcs, out _);
+                            using var rsa = cert.GetRSAPublicKey()!;
+                            var cr = RandomNumberGenerator.GetBytes(32);
+                            var enc = rsa.Encrypt(cr, RSAEncryptionPadding.Pkcs1);
+                            await WriteTpktAsync(stream, [0x02, 0xF0, 0x80, 0x04, 0, 0, 0, 0]);
+                            await WriteTpktAsync(stream, [0x02, 0xF0, 0x80, 0x28, 0, 0, 0x03, 0xEA]);
+                            _ = await ReadTpktAsync(stream);
+                            await WriteTpktAsync(stream, [0x02, 0xF0, 0x80, 0x38, 0, 0, 0x03, 0xEB]);
+                            _ = await ReadTpktAsync(stream);
+                            await WriteTpktAsync(stream, BuildDataPacket(0x0001, enc));
+                            _ = await ReadTpktAsync(stream);
+                            var domain = Encoding.Unicode.GetBytes("TESTDOMAIN\0");
+                            var un = Encoding.Unicode.GetBytes($"{user}\0");
+                            var pw = Encoding.Unicode.GetBytes($"{pass}\0");
+                            var info = BuildInfoPdu(domain, un, pw);
+                            await WriteTpktAsync(stream, BuildDataPacket(0x0040, info));
+                            _ = await ReadTpktAsync(stream);
+                            return (localPort, user, pass, true);
+                        }
+                        catch { return (0, user, pass, false); }
+                    });
+                }
+                var results = await Task.WhenAll(tasks);
+                var expectedByPort = new Dictionary<int, (string user, string pass)>();
+                var opened = 0;
+                foreach (var r in results) { if (r.ok) { opened++; expectedByPort[r.port] = (r.user, r.pass); } }
+
+var deadline = DateTime.UtcNow.AddSeconds(15);
+                while (DateTime.UtcNow < deadline)
+                {
+                    var credCount = CountCredentialUsers(logDir, $"map-user-{round:D1}-");
+                    if (credCount >= count) break;
+                    await Task.Delay(50);
+                }
+
+                var sessionBySourcePort = BuildSessionBySourcePort(logDir);
+                var credBySession = BuildCredentialBySession(logDir, $"map-user-{round:D1}-");
+
+                var mismatched = 0; var missing = 0; var duplicate = 0; var crossWired = 0;
+                var uniqueSids = new HashSet<long>(); var uniquePorts = new HashSet<int>();
+                var sidsForPort = new Dictionary<int, List<long>>();
+
+                foreach (var (clientPort, expected) in expectedByPort)
+                {
+                    if (!sessionBySourcePort.TryGetValue(clientPort, out var sid)) { missing++; continue; }
+                    var sidCount = sidsForPort.TryGetValue(port, out var list) ? list : (sidsForPort[port] = new List<long>());
+                    if (sidCount.Contains(sid)) duplicate++; else { sidCount.Add(sid); uniqueSids.Add(sid); uniquePorts.Add(clientPort); }
+                    if (!credBySession.TryGetValue(sid, out var cred)) { missing++; continue; }
+                    if (cred.user != expected.user || cred.pass != expected.pass) { mismatched++; crossWired++; }
+                    if (cred.sourcePort != 0 && cred.sourcePort != clientPort) { mismatched++; crossWired++; }
+                }
+
+                var ok = opened == count && credBySession.Count == count &&
+                         mismatched == 0 && missing == 0 && duplicate == 0 && crossWired == 0 &&
+                         uniqueSids.Count == count && uniquePorts.Count == count;
+                allOk &= ok;
+                Console.WriteLine($"{(ok ? "PASS" : "FAIL")} Concurrent(session) mapping round {round + 1}/{rounds}: " +
+                    $"opened={opened}/{count} captured={credBySession.Count} uniqueSid={uniqueSids.Count} uniquePort={uniquePorts.Count} " +
+                    $"missing={missing} duplicate={duplicate} crossWired={crossWired}");
+            }
+            finally { foreach (var c in clients) c?.Dispose(); }
+        }
+        return allOk ? 0 : 1;
+    }
+
+static IEnumerable<string> ReadLinesWithRetry(string path, int maxRetries = 20)
+    {
+        for (var i = 0; i < maxRetries; i++)
+        {
+            try { return File.ReadAllLines(path); }
+            catch (IOException) { Thread.Sleep(50); }
+        }
+        return File.ReadAllLines(path);
+    }
+
+    static int CountCredentialUsers(string logDir, string prefix)
+    {
+        var path = Path.Combine(logDir, "captured_creds.jsonl");
+        if (!File.Exists(path)) return 0;
+        var count = 0;
+        foreach (var line in ReadLinesWithRetry(path))
+        {
+            try
+            {
+                using var json = JsonDocument.Parse(line);
+                var u = json.RootElement.GetProperty("username").GetString();
+                if (u?.StartsWith(prefix) == true) count++;
+            }
+            catch (JsonException) { }
+        }
+        return count;
+    }
+
+    static Dictionary<int, long> BuildSessionBySourcePort(string logDir)
+    {
+        var map = new Dictionary<int, long>();
+        foreach (var dir in Directory.GetDirectories(logDir, "session_*"))
+        {
+            var logPath = Path.Combine(dir, "session.log");
+            if (!File.Exists(logPath)) continue;
+            var first = File.ReadLines(logPath).FirstOrDefault();
+            if (first == null) continue;
+            var m = System.Text.RegularExpressions.Regex.Match(first, @"Session (\d+) from [\d.]+:(\d+)");
+            if (!m.Success) continue;
+            var sid = long.Parse(m.Groups[1].Value);
+            var srcPort = int.Parse(m.Groups[2].Value);
+            map[srcPort] = sid;
+        }
+        return map;
+    }
+
+    static Dictionary<long, (string user, string pass, int sourcePort)> BuildCredentialBySession(string logDir, string prefix)
+    {
+        var map = new Dictionary<long, (string user, string pass, int sourcePort)>();
+        var path = Path.Combine(logDir, "captured_creds.jsonl");
+        if (!File.Exists(path)) return map;
+foreach (var line in ReadLinesWithRetry(path))
+        {
+            try
+            {
+                using var json = JsonDocument.Parse(line);
+                var root = json.RootElement;
+                var user = root.GetProperty("username").GetString();
+                if (user?.StartsWith(prefix) != true) continue;
+                var sid = root.GetProperty("session_id").GetInt64();
+                var pass = root.TryGetProperty("password", out var p) && p.ValueKind == JsonValueKind.String ? p.GetString() : null;
+                var srcPort = root.TryGetProperty("source_port", out var sp) ? sp.GetInt32() : 0;
+                if (!map.ContainsKey(sid)) map[sid] = (user, pass ?? "", srcPort);
+            }
+            catch (JsonException) { }
+        }
+        return map;
+    }
+
+    static async Task<int> RunShutdownFlushAsync(string[] args)
+    {
+        var host = GetOption(args, "--host") ?? "127.0.0.1";
+        var port = int.Parse(GetOption(args, "--port") ?? "13389");
+        var logDir = GetOption(args, "--log-dir") ?? throw new ArgumentException("--log-dir is required");
+        var rounds = int.Parse(GetOption(args, "--rounds") ?? "50");
+        const string user = "flush-user";
+        const string pass = "Flush-Pass-000!";
+        var failures = 0;
+
+        for (var round = 0; round < rounds; round++)
+        {
+            var dir = Path.Combine(logDir, $"round_{round:D3}");
+            Directory.CreateDirectory(dir);
+            var options = new HoneypotOptions();
+            options.Ports = [port];
+            options.LogDir = dir;
+            options.ConsoleLogLevel = "Error";
+            options.EnableRawCapture = false;
+            options.Profile = new RdpServerProfile
+            {
+                ComputerName = "WIN-SRV01",
+                DomainName = "WORKGROUP",
+                EnableTls = true,
+                EnableNla = true,
+                EnableStandardSecurity = true,
+                CertificateSubject = "CN=WIN-SRV01",
+                CertificatePath = Path.Combine(dir, "cert.pfx"),
+                PersistCertificate = true
+            };
+
+            var server = new HoneypotServer(options);
+            var cts = new CancellationTokenSource();
+            var serverTask = Task.Run(() => server.RunAsync(cts.Token));
+
+            // 等待 port ready
+            var ready = false;
+            for (var i = 0; i < 40 && !ready; i++)
+            {
+                try { using var t = new TcpClient(); await t.ConnectAsync(host, port); ready = true; }
+                catch { await Task.Delay(50); }
+            }
+            if (!ready) { failures++; Console.WriteLine($"FAIL round {round + 1}: server not ready"); continue; }
+
+            // 完整 standard security 流程，送出 credential
+            string? capturedSourcePort = null;
+            try
+            {
+                using var client = new TcpClient();
+                await client.ConnectAsync(host, port);
+                capturedSourcePort = ((IPEndPoint)client.Client.LocalEndPoint!).Port.ToString();
+                using var stream = client.GetStream();
+                await WriteTpktAsync(stream, [0x06, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x00]);
+                _ = await ReadTpktAsync(stream);
+                await WriteTpktAsync(stream, [0x02, 0xF0, 0x80, 0x7F, 0x65, 0x00]);
+                var mcs = await ReadTpktAsync(stream);
+                using var cert = ExtractCertificate(mcs, out _);
+                using var rsa = cert.GetRSAPublicKey()!;
+                var cr = RandomNumberGenerator.GetBytes(32);
+                var enc = rsa.Encrypt(cr, RSAEncryptionPadding.Pkcs1);
+                await WriteTpktAsync(stream, [0x02, 0xF0, 0x80, 0x04, 0, 0, 0, 0]);
+                await WriteTpktAsync(stream, [0x02, 0xF0, 0x80, 0x28, 0, 0, 0x03, 0xEA]);
+                _ = await ReadTpktAsync(stream);
+                await WriteTpktAsync(stream, [0x02, 0xF0, 0x80, 0x38, 0, 0, 0x03, 0xEB]);
+                _ = await ReadTpktAsync(stream);
+                await WriteTpktAsync(stream, BuildDataPacket(0x0001, enc));
+                _ = await ReadTpktAsync(stream);
+                var domain = Encoding.Unicode.GetBytes("TESTDOMAIN\0");
+                var un = Encoding.Unicode.GetBytes($"{user}\0");
+                var pw = Encoding.Unicode.GetBytes($"{pass}\0");
+                var info = BuildInfoPdu(domain, un, pw);
+                await WriteTpktAsync(stream, BuildDataPacket(0x0040, info));
+                // 送出 Info PDU 後不要等回應，立即觸發 shutdown
+            }
+            catch { /* 連線可能因 shutdown 中斷，視為正常 */ }
+
+            // 立即取消 server → graceful shutdown（await active session + drain recorder）
+            cts.Cancel();
+            try { await serverTask.WaitAsync(TimeSpan.FromSeconds(20)); }
+            catch { failures++; Console.WriteLine($"FAIL round {round + 1}: server shutdown timeout"); continue; }
+
+            // 驗證 credential 已持久化且只出現一次
+            var path = Path.Combine(dir, "captured_creds.jsonl");
+            var matches = 0;
+            if (File.Exists(path))
+            {
+                foreach (var line in await File.ReadAllLinesAsync(path))
+                {
+                    if (line.Contains(user) && line.Contains(pass))
+                        matches++;
+                }
+            }
+            var ok = matches == 1;
+            if (!ok) failures++;
+            Console.WriteLine($"{(ok ? "PASS" : "FAIL")} Shutdown flush round {round + 1}/{rounds}: matches={matches} (expect 1)");
+        }
+        return failures == 0 ? 0 : 1;
+    }
+static async Task<int> RunSequentialSessionAsync(string[] args)
     {
         var host = GetOption(args, "--host") ?? "127.0.0.1";
         var port = int.Parse(GetOption(args, "--port") ?? "13389");
@@ -619,4 +888,9 @@ public static class IntegrationRunner
         return index >= 0 && index + 1 < args.Length ? args[index + 1] : null;
     }
 }
+
+
+
+
+
 

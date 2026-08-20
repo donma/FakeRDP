@@ -89,6 +89,7 @@ public sealed class EventRecorder : IDisposable
     // ── 計數器（§25） ──
     long _credentialAcceptedCount;
     long _credentialDroppedCount;
+    long _credentialPersistFailCount;
     long _credentialWithPasswordCount;
     long _credentialWithoutPasswordCount;
     long _telemetryDroppedCount;
@@ -97,6 +98,7 @@ public sealed class EventRecorder : IDisposable
     public int Capacity { get; }
     public long CredentialEventsAccepted => Interlocked.Read(ref _credentialAcceptedCount);
     public long CredentialEventsDropped => Interlocked.Read(ref _credentialDroppedCount);
+    public long CredentialPersistFailures => Interlocked.Read(ref _credentialPersistFailCount);
     public long CredentialEventsWithPassword => Interlocked.Read(ref _credentialWithPasswordCount);
     public long CredentialEventsWithoutPassword => Interlocked.Read(ref _credentialWithoutPasswordCount);
     public long TelemetryEventsDropped => Interlocked.Read(ref _telemetryDroppedCount);
@@ -201,7 +203,11 @@ _channel = Channel.CreateBounded<HoneypotEvent>(new BoundedChannelOptions(capaci
         }
         catch (OperationCanceledException)
         {
-            // 正常關閉路徑
+            // 正常關閉路徑（_cts.Cancel）
+        }
+        catch (ChannelClosedException)
+        {
+            // 正常關閉路徑（CompleteAsync：writer complete + channel drained）
         }
         finally
         {
@@ -217,7 +223,11 @@ _channel = Channel.CreateBounded<HoneypotEvent>(new BoundedChannelOptions(capaci
                     await WriteBatchAsync(remaining, CancellationToken.None);
                     Interlocked.Add(ref _processedCount, remaining.Count);
                 }
-                catch { /* 最後清空階段不中斷 */ }
+                catch
+                {
+                    Interlocked.Add(ref _credentialPersistFailCount, remaining.Count);
+                    // 最後清空階段不因寫入失敗中斷，但計數器會反應
+                }
             }
         }
     }
@@ -258,10 +268,22 @@ _channel = Channel.CreateBounded<HoneypotEvent>(new BoundedChannelOptions(capaci
         {
             sb.AppendLine(JsonSerializer.Serialize(e, JsonlOptions));
         }
-        await File.AppendAllTextAsync(path, sb.ToString(), ct);
+        // 使用 FileShare.Read 讓測試讀取時不會被鎖住
+        using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read, 4096, true);
+        await fs.WriteAsync(Encoding.UTF8.GetBytes(sb.ToString()), ct);
     }
 
     bool _disposed;
+
+    /// <summary>
+    /// 明確完成寫入流程：停止接受新事件，等 reader loop 把 channel 全部 drain 後返回。
+    /// Server 正常 shutdown 應使用此方法，而非直接 Dispose()。
+    /// </summary>
+    public async Task CompleteAsync()
+    {
+        _channel.Writer.TryComplete();
+        await _loop; // 等待 reader loop 將所有殘留事件寫完後結束
+    }
 
     public void Dispose()
     {

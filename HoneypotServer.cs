@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -23,6 +24,7 @@ sealed class HoneypotServer
     readonly byte[] _serverRandom;
 
     long _sessionCounter;
+    readonly ConcurrentDictionary<long, Task> _activeSessions = new();
 
     public HoneypotServer(HoneypotOptions options)
     {
@@ -111,6 +113,24 @@ sealed class HoneypotServer
         catch (OperationCanceledException) { }
 
         foreach (var l in listeners) l.Stop();
+
+        // 停止 accept 後，等待所有 active session 完成（最大 grace 30s）
+        if (_activeSessions.Count > 0)
+        {
+            ConsoleLog(ConsoleLogLevel.Connection, $"Waiting for {_activeSessions.Count} active session(s) to finish...");
+            using var graceCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            try
+            {
+                await Task.WhenAll(_activeSessions.Values).WaitAsync(graceCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                ConsoleLog(ConsoleLogLevel.Error, "Grace timeout expired; some sessions may not have completed.");
+            }
+        }
+
+        // 最後 drain EventRecorder，確保所有 credential 已寫入磁碟
+        await recorder.CompleteAsync();
     }
 
     ConsoleLogLevel ConsoleLevel
@@ -139,7 +159,12 @@ sealed class HoneypotServer
                 if (ct.IsCancellationRequested) { client.Close(); break; }
 
                 var id = Interlocked.Increment(ref _sessionCounter);
-                var ep = (IPEndPoint)client.Client.RemoteEndPoint!;
+                if (client.Client.RemoteEndPoint is not IPEndPoint ep)
+                {
+                    // 無法取得來源 IP：拒絕建立 session（不假造 0.0.0.0）
+                    client.Close();
+                    continue;
+                }
                 if (IsConsoleLevelEnabled(ConsoleLogLevel.Connection))
                     Console.WriteLine($"[{id}] + Connection from {ep} -> port {localPort}");
 
@@ -148,7 +173,12 @@ sealed class HoneypotServer
                     _serverCert, _tlsCert, _rsaKey, _tlsRsaKey, _serverRandom,
                     limiter, tracker, recorder);
 
-                _ = session.RunAsync(ct);
+                var sessionTask = session.RunAsync(CancellationToken.None);
+                _activeSessions[id] = sessionTask;
+                _ = sessionTask.ContinueWith(t => {
+                    _activeSessions.TryRemove(id, out _);
+                    if (t.IsFaulted) ConsoleLog(ConsoleLogLevel.Error, $"[{id}] Session fault: {t.Exception?.InnerException?.Message}");
+                }, TaskContinuationOptions.ExecuteSynchronously);
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
