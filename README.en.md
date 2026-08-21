@@ -24,14 +24,15 @@ A defensive RDP honeypot written in C# / .NET 10. Deploy it only on networks and
 
 | Check | Result |
 |---|---|
-| Unit tests | 38/38 PASS |
+| Unit tests | 42/42 PASS |
 | Standard Security credential capture | PASS |
 | TLS Info PDU credential capture | PASS |
 | NLA / NTLM account capture | PASS |
 | 100 concurrent session mapping (no cross-wiring) | PASS |
 | 100-round shutdown credential flush (CompleteAsync after producers finish) | PASS |
 | Server shutdown waits for active sessions (two-phase: grace → force → CompleteAsync) | PASS |
-| CredentialWriteAfterClose (shutdown ordering indicator) | 0 (absent in graceful shutdown) |
+| 1000-credential (100×10 rounds) server shutdown regression | PASS |
+| WriteAfterClose after server shutdown | 0 (absent in graceful shutdown) |
 | Source IP normalization (null / IPv4-mapped IPv6) | PASS |
 | Nmap service detection (`-sV`) | PASS (`ms-wbt-server`) |
 
