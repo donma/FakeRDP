@@ -164,15 +164,16 @@ public sealed class RdpSessionCredentialConcurrencyTests : IDisposable
         Assert.True(allPassed, "All rounds must have no failures");
     }
 
-    /// <summary>
-    /// P0-2: 100 個並行 credential + 立即 shutdown，驗證所有 credential 已持久化且 mapping 正確。
+/// <summary>
+    /// P0-2 Recorder Hard Gate: 100 個 producers 全部完成後 → CompleteAsync。
+    /// 驗證 100/100 persisted、mapping 正確、WriteAfterClose == 0（§15, §39）。
     /// </summary>
     [Fact]
-    public async Task ConcurrentCredentials_ImmediateShutdown_DoesNotLoseOrCrossMap()
+    public async Task ConcurrentCredentials_CompleteImmediatelyAfterProducersFinish_DoesNotLoseOrCrossMap()
     {
         const int sessionCount = 100;
         var dir = CreateTempDir();
-        var recorder = new EventRecorder(1024, dir);
+        using var recorder = new EventRecorder(1024, dir);
         var expected = CreateExpectedCredentials(sessionCount);
 
         var sessions = expected.Select(x =>
@@ -188,46 +189,118 @@ public sealed class RdpSessionCredentialConcurrencyTests : IDisposable
                 dir, certTest, certTest, rsaTest, rsaTest, new byte[32],
                 limiter, tracker, recorder);
         }).ToArray();
-
-        // 建立 session 目錄（真實 server 會在 session 建立時建立）
         foreach (var s in sessions) { Directory.CreateDirectory(Path.Combine(dir, $"session_{s.SessionId:D6}")); }
 
-        // 並行寫入，立即 shutdown 不等完成
+        // producer 全部完成 enqueue
         var tasks = sessions.Zip(expected, async (session, cred) =>
         {
-            await Task.Delay(Random.Shared.Next(0, 10));
+            await Task.Delay(Random.Shared.Next(0, 25));
             await session.SaveCredentialForTestAsync(cred.Username, cred.Password, cred.Domain);
         });
-        _ = Task.WhenAll(tasks); // fire-and-forget，不等完成
+        await Task.WhenAll(tasks);
 
-        // 立即 shutdown (graceful: CompleteAsync 會等 channel 清空)
+        // 再 CompleteAsync（producer 已停止，channel 可以安全 drain）
         await recorder.CompleteAsync();
 
-        // 驗證
         var actual = await ReadCredentialEventsAsync(dir);
         var map = expected.ToDictionary(x => x.SessionId);
 
-        // 只驗證已寫入的部分（有些可能還在 task 中沒完成）
-        // 但至少要有 0 dropped
+        Assert.Equal(sessionCount, actual.Count);
+        Assert.Equal(sessionCount, recorder.CredentialEventsAttempted);
+        Assert.Equal(sessionCount, recorder.CredentialEventsAccepted);
+        Assert.Equal(sessionCount, recorder.CredentialEventsPersisted);
         Assert.Equal(0, recorder.CredentialEventsDropped);
         Assert.Equal(0, recorder.CredentialPersistFailures);
+        Assert.Equal(0, recorder.CredentialWriteAfterClose);
+        Assert.Equal(0, recorder.CredentialQueueTimeout);
 
-        // 所有已寫入的 credential 必須 mapping 正確
         foreach (var evt in actual)
         {
-            Assert.True(map.TryGetValue(evt.SessionId, out var expectedCred),
-                $"SessionId {evt.SessionId} not found in expected");
-            Assert.Equal(expectedCred.SourceIp, evt.SourceIp);
-            Assert.Equal(expectedCred.SourcePort, evt.SourcePort);
-            Assert.Equal(expectedCred.TargetPort, evt.TargetPort);
-            Assert.Equal(expectedCred.Username, evt.Username);
-            Assert.Equal(expectedCred.Password, evt.Password);
-            Assert.Equal(expectedCred.Domain, evt.Domain);
+            Assert.True(map.TryGetValue(evt.SessionId, out var cred), $"SessionId {evt.SessionId} not found");
+            Assert.Equal(cred.SourceIp, evt.SourceIp);
+            Assert.Equal(cred.SourcePort, evt.SourcePort);
+            Assert.Equal(cred.TargetPort, evt.TargetPort);
+            Assert.Equal(cred.Username, evt.Username);
+            Assert.Equal(cred.Password, evt.Password);
+            Assert.Equal(cred.Domain, evt.Domain);
         }
-
-        // 沒有 cross-wired（不同 SessionId 不應有相同 Username 等）
         Assert.Equal(actual.Count, actual.Select(x => x.SessionId).Distinct().Count());
         Assert.Equal(actual.Count, actual.Select(x => x.Username).Distinct().Count());
+    }
+
+    /// <summary>
+    /// P1: 正常 graceful shutdown 必須 WriteAfterClose == 0。
+    /// </summary>
+    [Fact]
+    public async Task GracefulShutdown_DoesNotWriteAfterClose()
+    {
+        const int n = 20;
+        var dir = CreateTempDir();
+        using var recorder = new EventRecorder(64, dir);
+        var expected = CreateExpectedCredentials(n);
+        var sessions = expected.Select(x => {
+            var ep = new IPEndPoint(IPAddress.Parse(x.SourceIp), x.SourcePort);
+            var l = new SessionLimiter(100); var t = new IpConnectionTracker(100, 100);
+            var (rsa, cert) = CryptoHelper.CreateRsaCert("CN=TEST");
+            return new RdpSession(x.SessionId, ep, x.TargetPort, new TcpClient(),
+                new HoneypotOptions { LogDir = dir, ConsoleLogLevel = "Error" },
+                dir, cert, cert, rsa, rsa, new byte[32], l, t, recorder);
+        }).ToArray();
+        foreach (var s in sessions) Directory.CreateDirectory(Path.Combine(dir, $"session_{s.SessionId:D6}"));
+
+        var tasks = sessions.Zip(expected, (s, c) => s.SaveCredentialForTestAsync(c.Username, c.Password, c.Domain));
+        await Task.WhenAll(tasks);
+        await recorder.CompleteAsync();
+
+        Assert.Equal(0, recorder.CredentialWriteAfterClose);
+        Assert.Equal(n, recorder.CredentialEventsPersisted);
+    }
+
+    /// <summary>
+    /// P0: producer 在 recorder 已 close 後才寫入 → WriteAfterClose 可觀察，Accepted=0。
+    /// </summary>
+    [Fact]
+    public async Task CredentialWriteAfterClose_IsObservable()
+    {
+        var dir = CreateTempDir();
+        using var recorder = new EventRecorder(64, dir);
+        await recorder.CompleteAsync();
+
+        var evt = new HoneypotEvent {
+            EventType = "credential", Event = "credential_captured",
+            SessionId = 999, Timestamp = DateTime.UtcNow,
+            SourceIp = "127.0.0.1", SourcePort = 50001, TargetPort = 4499,
+            Username = "late-user", Password = "late-pass", AuthMode = "standard"
+        };
+        var ok = await recorder.TryWriteCredentialAsync(evt);
+        Assert.False(ok);
+        Assert.Equal(1, recorder.CredentialWriteAfterClose);
+        Assert.Equal(0, recorder.CredentialEventsAccepted);
+        Assert.Equal(0, recorder.CredentialEventsPersisted);
+    }
+
+    /// <summary>
+    /// P1: CompleteAsync 可安全呼叫多次（idempotent，§30）。
+    /// </summary>
+    [Fact]
+    public async Task CompleteAsync_CanBeCalledMultipleTimes()
+    {
+        var dir = CreateTempDir();
+        using var recorder = new EventRecorder(64, dir);
+        var evt = new HoneypotEvent {
+            EventType = "credential", Event = "credential_captured",
+            SessionId = 1, Timestamp = DateTime.UtcNow,
+            SourceIp = "127.0.0.1", SourcePort = 50001, TargetPort = 4499,
+            Username = "user", Password = "pass", AuthMode = "standard"
+        };
+        Assert.True(await recorder.TryWriteCredentialAsync(evt));
+
+        await recorder.CompleteAsync();
+        await recorder.CompleteAsync();
+        recorder.Dispose();
+
+        Assert.Equal(1, recorder.CredentialEventsPersisted);
+        Assert.Equal(0, recorder.CredentialWriteAfterClose);
     }
 
 /// <summary>
@@ -323,3 +396,4 @@ public sealed class RdpSessionCredentialConcurrencyTests : IDisposable
         Assert.Equal(0, recorder.CredentialEventsDropped);
     }
 }
+

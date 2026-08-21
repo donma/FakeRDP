@@ -94,17 +94,22 @@ public sealed class EventRecorder : IDisposable
     long _credentialAttemptedCount;
     long _credentialAcceptedCount;
     long _credentialDroppedCount;
+    long _credentialQueueTimeoutCount;
+    long _credentialWriteAfterCloseCount;
     long _credentialPersistedCount;
     long _credentialPersistFailCount;
     long _credentialWithPasswordCount;
     long _credentialWithoutPasswordCount;
     long _telemetryDroppedCount;
     long _processedCount;
+    int _completed;
 
     public int Capacity { get; }
     public long CredentialEventsAttempted => Interlocked.Read(ref _credentialAttemptedCount);
     public long CredentialEventsAccepted => Interlocked.Read(ref _credentialAcceptedCount);
     public long CredentialEventsDropped => Interlocked.Read(ref _credentialDroppedCount);
+    public long CredentialQueueTimeout => Interlocked.Read(ref _credentialQueueTimeoutCount);
+    public long CredentialWriteAfterClose => Interlocked.Read(ref _credentialWriteAfterCloseCount);
     public long CredentialEventsPersisted => Interlocked.Read(ref _credentialPersistedCount);
     public long CredentialPersistFailures => Interlocked.Read(ref _credentialPersistFailCount);
     public long CredentialEventsWithPassword => Interlocked.Read(ref _credentialWithPasswordCount);
@@ -167,14 +172,24 @@ public EventRecorder(int capacity, string logDir)
     /// 安全寫入 credential 事件：使用 bounded timeout (2s) + linked CTS，
     /// 確保不靜默丟棄（除非 timeout）。正常狀況下 CredentialEventsDropped 應為 0。
     ///
-    /// 計數器語意（§16）：
+    /// 計數器語意（§16, §27）：
     ///   Attempted = 被呼叫
     ///   Accepted = 成功放進 Channel
-    ///   Dropped = 無法放進 Channel（timeout / cancellation）
+    ///   Dropped = 無法放進 Channel
+    ///   QueueTimeout = channel 滿導致 WriteAsync timeout（附計於 Dropped）
+    ///   WriteAfterClose = producer 在 recorder 完成後嘗試寫入（shutdown ordering bug 指標）
     /// </summary>
     public async Task<bool> TryWriteCredentialAsync(HoneypotEvent evt, CancellationToken outerCt = default)
     {
         Interlocked.Increment(ref _credentialAttemptedCount);
+
+        // recorder 已進入 Complete 狀態：不應該再有人寫入
+        if (Volatile.Read(ref _completed) != 0)
+        {
+            Interlocked.Increment(ref _credentialWriteAfterCloseCount);
+            return false;
+        }
+
         using var timeoutCts = new CancellationTokenSource(CredentialWriteTimeout);
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(outerCt, timeoutCts.Token);
         try
@@ -190,14 +205,21 @@ public EventRecorder(int capacity, string logDir)
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !outerCt.IsCancellationRequested)
         {
-            // 真正的 timeout（非外部的 cancellation）
+            // 真正的 queue timeout（非外部 cancellation）
             Interlocked.Increment(ref _credentialDroppedCount);
+            Interlocked.Increment(ref _credentialQueueTimeoutCount);
             return false;
         }
         catch (OperationCanceledException)
         {
-            // 外部的 cancellation（例如 server shutdown）
+            // 外部 cancellation（例如 session/application 取消）— 不歸類為 queue timeout
             Interlocked.Increment(ref _credentialDroppedCount);
+            return false;
+        }
+        catch (ChannelClosedException)
+        {
+            // producer 嘗試在 recorder 已 close 後寫入 → shutdown ordering bug
+            Interlocked.Increment(ref _credentialWriteAfterCloseCount);
             return false;
         }
     }
@@ -242,6 +264,12 @@ public EventRecorder(int capacity, string logDir)
                 {
                     // 取消發生在批次寫入期間：buffer 內的事件不能丟棄，
                     // 交由 finally 以 CancellationToken.None 補寫。
+                }
+                catch (Exception)
+                {
+                    // 非取消失敗（如磁碟錯誤）：計入 PersistFailures，不 crash loop。
+                    Interlocked.Add(ref _credentialPersistFailCount, buffer.Count);
+                    buffer.Clear(); // 已嘗試寫入但失敗，避免重複迴圈
                 }
             }
         }
@@ -325,22 +353,43 @@ public EventRecorder(int capacity, string logDir)
     /// <summary>
     /// 明確完成寫入流程：停止接受新事件，等 reader loop 把 channel 全部 drain 後返回。
     /// Server 正常 shutdown 應使用此方法，而非直接 Dispose()。
+    /// 可安全重複呼叫（idempotent，§30）。
     /// </summary>
     public async Task CompleteAsync()
     {
+        if (Interlocked.Exchange(ref _completed, 1) != 0)
+        {
+            // 已觸發過：仍等待 loop 完成，確保呼叫端取得完整 drain 保證
+            try { await _loop; }
+            catch (OperationCanceledException) { }
+            catch (ChannelClosedException) { }
+            return;
+        }
+
         _channel.Writer.TryComplete();
-        await _loop; // 等待 reader loop 將所有殘留事件寫完後結束
+        // 等待 reader loop 將所有殘留事件寫完後結束
+        try { await _loop; }
+        catch (OperationCanceledException) { }
+        catch (ChannelClosedException) { }
+    }
+
+    /// <summary>
+    /// Forced shutdown：取消 reader loop，不保證 drain 完整。
+    /// 僅在 fatal error 無法 graceful shutdown 時使用。
+    /// </summary>
+    public void Abort()
+    {
+        _cts.Cancel();
+        try { _loop.GetAwaiter().GetResult(); }
+        catch { /* 不中斷 */ }
     }
 
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
-        _cts.Cancel();
-        // 先等待 loop 完全結束（含 finally drain），再關閉 writer
-        try { _loop.GetAwaiter().GetResult(); }
-        catch { /* 忽略 shutdown 錯誤 */ }
-        _channel.Writer.TryComplete();
+        // Graceful shutdown：先 complete（若尚未執行），再清理
+        CompleteAsync().GetAwaiter().GetResult();
         _cts.Dispose();
     }
 }
