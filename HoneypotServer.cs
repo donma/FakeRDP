@@ -25,6 +25,9 @@ sealed class HoneypotServer
 
     long _sessionCounter;
     readonly ConcurrentDictionary<long, Task> _activeSessions = new();
+    readonly ConcurrentDictionary<long, CancellationTokenSource> _sessionCtsSources = new();
+
+    internal int ActiveSessionCount => _activeSessions.Count;
 
     public HoneypotServer(HoneypotOptions options)
     {
@@ -114,10 +117,11 @@ sealed class HoneypotServer
 
         foreach (var l in listeners) l.Stop();
 
-        // 停止 accept 後，等待所有 active session 完成（最大 grace 30s）
+        // ── 兩階段 shutdown（§20）：graceful → force → CompleteAsync ──
+        // Phase 1: graceful 等待（不取消 session）
         if (_activeSessions.Count > 0)
         {
-            ConsoleLog(ConsoleLogLevel.Connection, $"Waiting for {_activeSessions.Count} active session(s) to finish...");
+            ConsoleLog(ConsoleLogLevel.Connection, $"Shutdown: waiting for {_activeSessions.Count} active session(s) gracefully...");
             using var graceCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
             try
             {
@@ -125,12 +129,36 @@ sealed class HoneypotServer
             }
             catch (OperationCanceledException)
             {
-                ConsoleLog(ConsoleLogLevel.Error, "Grace timeout expired; some sessions may not have completed.");
+                ConsoleLog(ConsoleLogLevel.Error, $"Shutdown: grace timeout ({_activeSessions.Count} session(s) remaining). Forcing stop...");
             }
         }
 
-        // 最後 drain EventRecorder，確保所有 credential 已寫入磁碟
+        // Phase 2: 若有 session 仍在跑（grace timeout 或已自然結束），force-stop 剩餘的
+        if (_activeSessions.Count > 0)
+        {
+            var remaining = _activeSessions.Keys.ToArray();
+            ConsoleLog(ConsoleLogLevel.Error, $"Shutdown: force-stopping {remaining.Length} session(s)...");
+            foreach (var sid in remaining)
+            {
+                if (_sessionCtsSources.TryGetValue(sid, out var cts))
+                {
+                    try { cts.Cancel(); } catch { }
+                }
+            }
+            // 等待 force-stop 生效
+            try
+            {
+                await Task.WhenAll(_activeSessions.Values).WaitAsync(TimeSpan.FromSeconds(10));
+            }
+            catch (OperationCanceledException)
+            {
+                ConsoleLog(ConsoleLogLevel.Error, $"Shutdown: force-stop timeout; {_activeSessions.Count} session(s) may remain.");
+            }
+        }
+
+        // 確認所有 producer 已停止後才 drain recorder
         await recorder.CompleteAsync();
+        ConsoleLog(ConsoleLogLevel.Connection, $"Shutdown completed. Active sessions: {_activeSessions.Count}.");
     }
 
     ConsoleLogLevel ConsoleLevel
@@ -144,6 +172,25 @@ sealed class HoneypotServer
     {
         if (IsConsoleLevelEnabled(level))
             Console.WriteLine(line);
+    }
+
+    async Task RunTrackedSessionAsync(long sessionId, RdpSession session, CancellationToken sessionCt)
+    {
+        try
+        {
+            await session.RunAsync(sessionCt);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            ConsoleLog(ConsoleLogLevel.Error, $"[{sessionId}] Session fault: {ex.Message}");
+        }
+        finally
+        {
+            _activeSessions.TryRemove(sessionId, out _);
+            if (_sessionCtsSources.TryRemove(sessionId, out var cts))
+                cts.Dispose();
+        }
     }
 
     async Task AcceptLoopAsync(TcpListener listener, SessionLimiter limiter,
@@ -173,12 +220,11 @@ sealed class HoneypotServer
                     _serverCert, _tlsCert, _rsaKey, _tlsRsaKey, _serverRandom,
                     limiter, tracker, recorder);
 
-                var sessionTask = session.RunAsync(CancellationToken.None);
+                // 每個 session 擁有獨立 CTS，供 force-stop 使用
+                var sessionCts = new CancellationTokenSource();
+                _sessionCtsSources[id] = sessionCts;
+                var sessionTask = RunTrackedSessionAsync(id, session, sessionCts.Token);
                 _activeSessions[id] = sessionTask;
-                _ = sessionTask.ContinueWith(t => {
-                    _activeSessions.TryRemove(id, out _);
-                    if (t.IsFaulted) ConsoleLog(ConsoleLogLevel.Error, $"[{id}] Session fault: {t.Exception?.InnerException?.Message}");
-                }, TaskContinuationOptions.ExecuteSynchronously);
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
