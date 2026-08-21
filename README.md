@@ -16,7 +16,20 @@
 - **資源保護**：全域 Session 上限、Per-IP / Per-/24 限制、超限自動降級為輕量回應（僅回 X.224 CC）
 - **憑證保護**：Credential 事件絕不靜默丟棄（`CredentialEventsDropped = 0`），shutdown 瞬間也不遺失（`CompleteAsync` drain）
 - **零系統侵入**：不修改 Windows 服務、防火牆、登錄檔；不接受低於 1024 的系統連接埠
-- **自動化驗收**：單元測試（30/30 測試通過）＋ 整合測試（standard/tls/nla）＋ AI 驗證 harness
+- **自動化驗收**：30 項單元測試 + 整合測試（standard/tls/nla）＋ AI 驗證 harness
+
+## 測試狀態
+
+| 項目 | 結果 |
+|---|---|
+| 單元測試 | 30/30 PASS |
+| Standard Security 憑證擷取 | PASS |
+| TLS Info PDU 憑證擷取 | PASS |
+| NLA / NTLM 帳號擷取 | PASS |
+| 50 條並行 Session 映射（無串線） | PASS |
+| 50 輪 Shutdown 瞬間不丟帳密 | PASS |
+| Source IP 正常化（null / IPv4-mapped IPv6） | PASS |
+| Nmap 服務偵測（`-sV`） | PASS（`ms-wbt-server`） |
 
 ---
 

@@ -18,7 +18,20 @@ A defensive RDP honeypot written in C# / .NET 10. Deploy it only on networks and
 - **Resource protection** — Global session limit, per-IP / per-/24 limits; overloaded connections receive a lightweight X.224 response only
 - **Credential safety** — Credential events are never silently dropped (`CredentialEventsDropped = 0`); a dedicated `CompleteAsync` drain guarantees persistence on shutdown, verified by a 50-round race test
 - **Zero system intrusion** — Does not modify Windows services, firewall rules, or the registry; rejects ports below 1024
-- **Automated validation** — 30/30 unit tests + integration tests (standard/tls/nla) + AI validation harness
+- **Automated validation** — 30 unit tests + integration tests (standard/tls/nla) + AI validation harness
+
+## Test Status
+
+| Check | Result |
+|---|---|
+| Unit tests | 30/30 PASS |
+| Standard Security credential capture | PASS |
+| TLS Info PDU credential capture | PASS |
+| NLA / NTLM account capture | PASS |
+| 50 concurrent session mapping (no cross-wiring) | PASS |
+| 50-round shutdown credential flush | PASS |
+| Source IP normalization (null / IPv4-mapped IPv6) | PASS |
+| Nmap service detection (`-sV`) | PASS (`ms-wbt-server`) |
 
 ---
 
