@@ -29,8 +29,14 @@ sealed class HoneypotServer
 
     internal int ActiveSessionCount => _activeSessions.Count;
 
+    internal TimeSpan SessionGraceTimeout { get; }
+
     public HoneypotServer(HoneypotOptions options)
+        : this(options, TimeSpan.FromSeconds(30)) { }
+
+    internal HoneypotServer(HoneypotOptions options, TimeSpan sessionGraceTimeout)
     {
+        SessionGraceTimeout = sessionGraceTimeout;
         _options = options;
         _logDir = options.LogDir ?? AppContext.BaseDirectory;
         Directory.CreateDirectory(_logDir);
@@ -122,7 +128,7 @@ sealed class HoneypotServer
         if (_activeSessions.Count > 0)
         {
             ConsoleLog(ConsoleLogLevel.Connection, $"Shutdown: waiting for {_activeSessions.Count} active session(s) gracefully...");
-            using var graceCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            using var graceCts = new CancellationTokenSource(SessionGraceTimeout);
             try
             {
                 await Task.WhenAll(_activeSessions.Values).WaitAsync(graceCts.Token);
