@@ -242,6 +242,141 @@ Assert.Equal(0, server.ActiveSessionCount);
         foreach (var c in clients) c.Dispose();
     }
 
+    /// <summary>
+    /// P0 (§27): 正常 server shutdown 後，CredentialWriteAfterClose == 0。
+    /// 驗證 shutdown lifecycle 沒有在 producer 尚未結束時關閉 recorder。
+    /// </summary>
+    [Fact]
+    public async Task ServerShutdown_DoesNotWriteCredentialAfterRecorderClose()
+    {
+        var dir = CreateTempDir();
+        var port = 14454;
+        var options = CreateOptions(dir, port);
+        options.McsTimeoutSeconds = 3;
+        var server = new HoneypotServer(options);
+        var cts = new CancellationTokenSource();
+        var serverTask = Task.Run(() => server.RunAsync(cts.Token));
+
+        await Task.Delay(3000);
+
+        // 完成一條完整 credential session
+        using (var c = new TcpClient())
+        {
+            await c.ConnectAsync("127.0.0.1", port);
+            var s = c.GetStream();
+            await WriteTpktAsync(s, new byte[] { 0x06, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x00 });
+            _ = await ReadTpktAsync(s);
+            await WriteTpktAsync(s, new byte[] { 0x02, 0xF0, 0x80, 0x7F, 0x65, 0x00 });
+            _ = await ReadTpktAsync(s);
+            await WriteTpktAsync(s, new byte[] { 0x02, 0xF0, 0x80, 0x04, 0x00, 0x00, 0x00, 0x00 });
+            await WriteTpktAsync(s, new byte[] { 0x02, 0xF0, 0x80, 0x28, 0x00, 0x00, 0x03, 0xEA });
+            _ = await ReadTpktAsync(s);
+            await WriteTpktAsync(s, new byte[] { 0x02, 0xF0, 0x80, 0x38, 0x00, 0x00, 0x03, 0xEB });
+            _ = await ReadTpktAsync(s);
+            await WriteTpktAsync(s, BuildDataPacket(0x0001, new byte[32]));
+            _ = await ReadTpktAsync(s);
+            var domainB = System.Text.Encoding.Unicode.GetBytes("TESTDOMAIN\0");
+            var userB = System.Text.Encoding.Unicode.GetBytes("wf-user\0");
+            var passB = System.Text.Encoding.Unicode.GetBytes("wf-pass\0");
+            var info = new byte[18 + domainB.Length + userB.Length + passB.Length + 16];
+            BitConverter.GetBytes(0u).CopyTo(info, 0);
+            BitConverter.GetBytes(0u).CopyTo(info, 4);
+            BitConverter.GetBytes((ushort)domainB.Length).CopyTo(info, 8);
+            BitConverter.GetBytes((ushort)userB.Length).CopyTo(info, 10);
+            BitConverter.GetBytes((ushort)passB.Length).CopyTo(info, 12);
+            domainB.CopyTo(info, 18); userB.CopyTo(info, 18 + domainB.Length); passB.CopyTo(info, 18 + domainB.Length + userB.Length);
+            await WriteTpktAsync(s, BuildDataPacket(0x0040, info));
+            _ = await ReadTpktAsync(s);
+        }
+        await Task.Delay(1500);
+
+        // shutdown
+        cts.Cancel();
+        await serverTask;
+
+        Assert.Equal(0, server.ActiveSessionCount);
+        Assert.Equal(0, server.CredentialWriteAfterClose);
+        Assert.Equal(0, server.CredentialEventsDropped);
+    }
+
+    /// <summary>
+    /// P0 (§47): 100 sessions × 10 rounds = 1000 credentials server shutdown regression。
+    /// </summary>
+    [Fact]
+    public async Task ServerShutdown_1000Credentials_10Rounds()
+    {
+        const int rounds = 10;
+        const int count = 100;
+        var totalPersisted = 0;
+        for (var round = 0; round < rounds; round++)
+        {
+            var dir = CreateTempDir();
+            var port = 14455 + round;
+            var options = CreateOptions(dir, port);
+            options.McsTimeoutSeconds = 5;
+            var server = new HoneypotServer(options);
+            var cts = new CancellationTokenSource();
+            var serverTask = Task.Run(() => server.RunAsync(cts.Token));
+
+            await Task.Delay(2000);
+
+            var clients = new List<TcpClient>();
+            var tasks = new List<Task>();
+            for (var i = 0; i < count; i++)
+            {
+                var user = $"r{round}-u-{i:D3}";
+                var pass = $"r{round}-p-{i:D3}";
+                tasks.Add(Task.Run(async () =>
+                {
+                    var c = new TcpClient();
+                    clients.Add(c);
+                    await c.ConnectAsync("127.0.0.1", port);
+                    var s = c.GetStream();
+                    await WriteTpktAsync(s, new byte[] { 0x06, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x00 });
+                    _ = await ReadTpktAsync(s);
+                    await WriteTpktAsync(s, new byte[] { 0x02, 0xF0, 0x80, 0x7F, 0x65, 0x00 });
+                    _ = await ReadTpktAsync(s);
+                    await WriteTpktAsync(s, new byte[] { 0x02, 0xF0, 0x80, 0x04, 0x00, 0x00, 0x00, 0x00 });
+                    await WriteTpktAsync(s, new byte[] { 0x02, 0xF0, 0x80, 0x28, 0x00, 0x00, 0x03, 0xEA });
+                    _ = await ReadTpktAsync(s);
+                    await WriteTpktAsync(s, new byte[] { 0x02, 0xF0, 0x80, 0x38, 0x00, 0x00, 0x03, 0xEB });
+                    _ = await ReadTpktAsync(s);
+                    await WriteTpktAsync(s, BuildDataPacket(0x0001, new byte[32]));
+                    _ = await ReadTpktAsync(s);
+                    var db = System.Text.Encoding.Unicode.GetBytes("TESTDOMAIN\0");
+                    var ub = System.Text.Encoding.Unicode.GetBytes($"{user}\0");
+                    var pb = System.Text.Encoding.Unicode.GetBytes($"{pass}\0");
+                    var info = new byte[18 + db.Length + ub.Length + pb.Length + 16];
+                    BitConverter.GetBytes(0u).CopyTo(info, 0);
+                    BitConverter.GetBytes(0u).CopyTo(info, 4);
+                    BitConverter.GetBytes((ushort)db.Length).CopyTo(info, 8);
+                    BitConverter.GetBytes((ushort)ub.Length).CopyTo(info, 10);
+                    BitConverter.GetBytes((ushort)pb.Length).CopyTo(info, 12);
+                    db.CopyTo(info, 18); ub.CopyTo(info, 18 + db.Length); pb.CopyTo(info, 18 + db.Length + ub.Length);
+                    await WriteTpktAsync(s, BuildDataPacket(0x0040, info));
+                    _ = await ReadTpktAsync(s);
+                }));
+            }
+            await Task.WhenAll(tasks);
+            await Task.Delay(1500);
+
+            cts.Cancel();
+            await serverTask;
+
+            var path = Path.Combine(dir, "captured_creds.jsonl");
+            var recordCount = File.Exists(path) ? (await File.ReadAllLinesAsync(path)).Length : 0;
+            totalPersisted += recordCount;
+
+            var deadline = DateTime.UtcNow.AddSeconds(5);
+            while (server.ActiveSessionCount > 0 && DateTime.UtcNow < deadline)
+                await Task.Delay(50);
+            Assert.Equal(0, server.ActiveSessionCount);
+            Assert.Equal(0, server.CredentialWriteAfterClose);
+            foreach (var c in clients) c.Dispose();
+        }
+        Assert.Equal(rounds * count, totalPersisted);
+    }
+
     static async Task WriteTpktAsync(NetworkStream stream, byte[] payload)
     {
         var packet = new byte[4 + payload.Length];

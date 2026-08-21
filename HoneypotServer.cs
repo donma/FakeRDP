@@ -29,6 +29,11 @@ sealed class HoneypotServer
 
     internal int ActiveSessionCount => _activeSessions.Count;
 
+    EventRecorder? _recorder;
+    internal long CredentialWriteAfterClose => _recorder?.CredentialWriteAfterClose ?? 0;
+    internal long CredentialEventsDropped => _recorder?.CredentialEventsDropped ?? 0;
+    internal long CredentialPersistFailures => _recorder?.CredentialPersistFailures ?? 0;
+
     internal TimeSpan SessionGraceTimeout { get; }
 
     public HoneypotServer(HoneypotOptions options)
@@ -81,6 +86,7 @@ sealed class HoneypotServer
             _options.MaxConcurrentPerIp, _options.MaxConcurrentPerSubnet);
         var limiter = new SessionLimiter(_options.MaxConcurrentSessions);
         using var recorder = new EventRecorder(_options.EventQueueCapacity, _logDir);
+        _recorder = recorder;
 
         var listeners = new List<TcpListener>();
         try
