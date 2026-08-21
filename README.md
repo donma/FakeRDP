@@ -22,12 +22,13 @@
 
 | 項目 | 結果 |
 |---|---|
-| 單元測試 | 30/30 PASS |
+| 單元測試 | 37/37 PASS |
 | Standard Security 憑證擷取 | PASS |
 | TLS Info PDU 憑證擷取 | PASS |
 | NLA / NTLM 帳號擷取 | PASS |
-| 50 條並行 Session 映射（無串線） | PASS |
-| 50 輪 Shutdown 瞬間不丟帳密 | PASS |
+| 100 條並行 Session 映射（無串線） | PASS |
+| 100 輪 Shutdown 瞬間不丟帳密 | PASS（producer 完成後才 CompleteAsync） |
+| CredentialWriteAfterClose（shutdown ordering bug 指標） | 0（正常 shutdown 不發生） |
 | Source IP 正常化（null / IPv4-mapped IPv6） | PASS |
 | Nmap 服務偵測（`-sV`） | PASS（`ms-wbt-server`） |
 
